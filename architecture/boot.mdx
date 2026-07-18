@@ -1,0 +1,237 @@
+---
+title: "SilverOS Boot Sequence: GRUB2 to kernel_main"
+sidebarTitle: "Boot Sequence"
+description: "Follow SilverOS from BIOS power-on through GRUB2 Multiboot2 handoff, the assembly entry stub, and into the C kernel_main initialization phases."
+---
+
+When the machine powers on, BIOS firmware locates GRUB2 on the boot device and loads it into memory. GRUB2 then reads its configuration, sets up a linear framebuffer, loads the SilverOS kernel ELF binary, and transfers control using the Multiboot2 protocol. An assembly entry stub in `boot/boot.asm` takes over — it builds identity-mapped page tables, enables 64-bit long mode, and finally calls `kernel_main` in C. This page traces every step of that journey.
+
+<Steps>
+  <Step title="BIOS / firmware loads GRUB2">
+    BIOS locates the GRUB2 bootloader on the boot device (stage 1 in the MBR, stage 2 on the filesystem) and executes it in 16-bit real mode. GRUB2 transitions to 32-bit protected mode internally before reading its configuration.
+  </Step>
+  <Step title="GRUB2 reads grub.cfg">
+    GRUB2 parses `boot/grub.cfg`, loads the video module, sets the framebuffer mode, and presents (or immediately selects) the SilverOS menu entry. The `multiboot2` directive tells GRUB2 to load the kernel using the Multiboot2 protocol.
+  </Step>
+  <Step title="GRUB2 loads the kernel ELF">
+    GRUB2 reads `/boot/silveros.bin`, parses its ELF headers, and copies each loadable segment to the physical addresses specified by the linker script (kernel base at 1 MB). GRUB2 detects the Multiboot2 header embedded in the `.multiboot` section and prepares a Multiboot2 info struct.
+  </Step>
+  <Step title="Multiboot2 handoff to _start">
+    GRUB2 jumps to the kernel's `_start` symbol in 32-bit protected mode, with `EBX` = pointer to Multiboot2 info struct and `EAX` = bootloader magic `0x36D76289`. The assembly stub immediately saves these into `EDI` and `ESI` (the first two SysV x86-64 integer argument registers).
+  </Step>
+  <Step title="Assembly stub: page tables + long mode">
+    `boot.asm` sets up a temporary 64 KB stack, builds four 2 MB-page page-directory tables that identity-map the first 4 GB of physical memory, loads PML4 into `CR3`, sets the PAE bit in `CR4`, sets the Long Mode Enable (LME) bit in `IA32_EFER`, and finally sets the PG bit in `CR0` to enable paging and activate long mode.
+  </Step>
+  <Step title="64-bit GDT load and far jump">
+    A minimal 64-bit GDT (null descriptor + code segment + data segment) is loaded with `lgdt`. A far jump to selector `0x08` flushes the instruction pipeline into 64-bit mode. Segment registers `DS`, `ES`, `FS`, `GS`, and `SS` are reloaded with the data segment selector `0x10`.
+  </Step>
+  <Step title="kernel_main called">
+    `call kernel_main` passes control to C. `RDI` holds the Multiboot2 info pointer; `RSI` holds the magic value. From here the ten-phase init sequence described in [Architecture Overview](/architecture/overview) runs to completion.
+  </Step>
+</Steps>
+
+---
+
+## GRUB2 configuration
+
+GRUB2 reads `boot/grub.cfg` on startup. SilverOS ships the following configuration:
+
+```bash
+set timeout=0
+set default=0
+
+insmod all_video
+set gfxmode=1024x768x32,800x600x32,auto
+set gfxpayload=keep
+
+menuentry "SilverOS" {
+    multiboot2 /boot/silveros.bin
+    boot
+}
+```
+
+Key settings:
+
+- **`timeout=0`** — GRUB2 does not show a countdown; it boots immediately to `default=0`, the only menu entry.
+- **`insmod all_video`** — loads all GRUB2 video drivers so that a suitable graphics mode can be set before the kernel takes over.
+- **`gfxmode=1024x768x32,800x600x32,auto`** — GRUB2 attempts to set a 1024×768 32-bpp linear framebuffer first, falls back to 800×600 32-bpp, and finally accepts whatever the firmware provides. This matches the framebuffer tag in the Multiboot2 header (see below).
+- **`gfxpayload=keep`** — instructs GRUB2 to hand the selected graphics mode through to the kernel rather than resetting the display.
+- **`multiboot2 /boot/silveros.bin`** — loads the kernel using the Multiboot2 protocol. GRUB2 parses the ELF, loads segments, builds a Multiboot2 info struct, and jumps to `_start`.
+
+## Multiboot2 header
+
+Every Multiboot2-compliant kernel must embed a header in its first 32 KB. In SilverOS this header lives in the dedicated `.multiboot` section of `boot/boot.asm` and is the very first thing placed into the binary by the linker script.
+
+```nasm
+section .multiboot
+align 8
+
+mb2_header_start:
+    dd 0xE85250D6                              ; magic
+    dd 0                                       ; architecture: i386 (protected mode)
+    dd mb2_header_end - mb2_header_start       ; header length
+    dd -(0xE85250D6 + 0 + (mb2_header_end - mb2_header_start)) ; checksum
+
+    ; Framebuffer tag — request 1024×768×32
+    align 8
+    dw 5        ; type: framebuffer
+    dw 0        ; flags (not optional)
+    dd 20       ; size
+    dd 1024     ; width
+    dd 768      ; height
+    dd 32       ; bpp
+
+    ; End tag
+    align 8
+    dw 0
+    dw 0
+    dd 8
+mb2_header_end:
+```
+
+What each field means:
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| Magic | `0xE85250D6` | Identifies this as a Multiboot2 header to GRUB2 |
+| Architecture | `0` | Requests i386 32-bit protected mode entry (standard for x86_64 kernels) |
+| Checksum | computed | Must make the four header `dd` fields sum to zero mod 2³² |
+| Framebuffer tag (type 5) | 1024×768×32 | Asks GRUB2 to set a 32-bpp linear framebuffer before handoff |
+| End tag (type 0) | — | Marks the end of the tag list |
+
+On entry to `_start`, GRUB2 guarantees:
+- `EAX` = `0x36D76289` (`MULTIBOOT2_BOOTLOADER_MAGIC`) — the kernel confirms this before doing anything else.
+- `EBX` = physical address of the Multiboot2 info struct.
+
+## Assembly entry stub (boot.asm)
+
+The full entry stub in `boot/boot.asm` performs six tasks before calling C:
+
+1. **Saves arguments** — `EBX` (Multiboot2 info pointer) → `EDI`; `EAX` (magic) → `ESI`. These map to the first two SysV x86-64 integer arguments (`RDI`, `RSI`) which `kernel_main` receives.
+
+2. **Sets up a 64 KB stack** — the `.bss` section reserves `stack_bottom` to `stack_top` (65 536 bytes, 16-byte aligned). `ESP` is pointed at `stack_top`.
+
+3. **Builds identity-mapped page tables** — four page-directory tables (`pd_table` through `pd_table4`) each hold 512 entries of 2 MB huge pages, covering 0–4 GB. A single PDPT and PML4 wire them together. Every entry is marked present + writable + huge (`0x83`).
+
+4. **Enables PAE and long mode** — PAE is set in `CR4`; the PML4 base is loaded into `CR3`; the LME bit is set in `IA32_EFER` (MSR `0xC0000080`); paging is activated via `CR0`.
+
+5. **Loads a 64-bit GDT and far-jumps** — a three-entry GDT (null, 64-bit code, 64-bit data) is defined in `.rodata`. `lgdt` loads it; `jmp 0x08:long_mode_start` completes the transition.
+
+6. **Calls `kernel_main`** — segment registers are reloaded, `RSP` is set to `stack_top`, and `call kernel_main` passes control to C.
+
+```nasm
+_start:
+    mov edi, ebx          ; multiboot info pointer → 1st arg
+    mov esi, eax          ; magic → 2nd arg
+    mov esp, stack_top
+
+    ; ... page table setup, PAE, long mode ...
+
+    lgdt [gdt64_pointer]
+    jmp 0x08:long_mode_start
+
+long_mode_start:
+    mov ax, 0x10
+    mov ds, ax
+    ; ... reload es, fs, gs, ss ...
+    mov rsp, stack_top
+    call kernel_main
+
+.hang:
+    cli
+    hlt
+    jmp .hang
+```
+
+<Note>
+If `kernel_main` ever returns (it shouldn't — `desktop_run` and the shell loop never return), the stub enters a `cli` / `hlt` spin loop to prevent undefined behaviour.
+</Note>
+
+## Linker script
+
+`boot/linker.ld` controls the physical layout of the kernel binary:
+
+```ld
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 1M;  /* Kernel loaded at 1 MB */
+
+    _kernel_start = .;
+
+    .multiboot ALIGN(8)  : { *(.multiboot) }
+    .text      ALIGN(4K) : { *(.text)  *(.text.*)  }
+    .rodata    ALIGN(4K) : { *(.rodata) *(.rodata.*) }
+    .data      ALIGN(4K) : { *(.data)  *(.data.*)  }
+    .bss       ALIGN(4K) : { *(COMMON) *(.bss) *(.bss.*) }
+
+    _kernel_end = .;
+}
+```
+
+Important details:
+
+- **`. = 1M`** — the load address starts at 1 MB physical (`0x00100000`). The first 1 MB is left free for the real-mode IVT, BIOS data area, and GRUB2 structures.
+- **`.multiboot ALIGN(8)`** — the Multiboot2 header must appear within the first 32 KB of the image and be 8-byte aligned. Placing it first ensures this.
+- **Sections `ALIGN(4K)`** — each section starts on a 4 KB page boundary. This makes future page-granularity permissions straightforward (e.g., marking `.rodata` read-only).
+- **`_kernel_start` / `_kernel_end`** — these linker symbols are exported as `extern uint64_t` in `kernel.c` and passed to `pmm_init()` so the PMM can reserve the exact range of pages occupied by the kernel image.
+- **`/DISCARD/`** — `.comment`, `.note.*`, and `.eh_frame*` sections are stripped from the output to keep the binary small.
+
+## Multiboot2 info parsing
+
+`kernel_main` receives `multiboot_info_addr` as its first argument. The Multiboot2 info block starts with a fixed 8-byte header (`total_size`, `reserved`) followed by a variable-length list of tags, each beginning with a `type` and `size` field.
+
+```c
+struct multiboot2_tag *tag = (struct multiboot2_tag *)((uint8_t *)mbi + 8);
+while (tag->type != MULTIBOOT2_TAG_TYPE_END) {
+    if (tag->type == MULTIBOOT2_TAG_TYPE_FRAMEBUFFER)
+        fb_tag   = (struct multiboot2_tag_framebuffer *)tag;
+    else if (tag->type == MULTIBOOT2_TAG_TYPE_BASIC_MEMINFO)
+        mem_tag  = (struct multiboot2_tag_basic_meminfo *)tag;
+    else if (tag->type == MULTIBOOT2_TAG_TYPE_MMAP)
+        mmap_tag = (struct multiboot2_tag_mmap *)tag;
+
+    tag = multiboot2_next_tag(tag);   /* advance past current tag, 8-byte aligned */
+}
+```
+
+The three tags extracted:
+
+| Tag type | Constant | Used for |
+|----------|----------|---------|
+| 8 | `MULTIBOOT2_TAG_TYPE_FRAMEBUFFER` | Framebuffer base address, width, height, pitch, bpp — passed to `fb_init()` |
+| 4 | `MULTIBOOT2_TAG_TYPE_BASIC_MEMINFO` | `mem_upper` field gives an upper-memory size estimate, used as a fallback for `total_mem` |
+| 6 | `MULTIBOOT2_TAG_TYPE_MMAP` | Full memory map with type codes (`MULTIBOOT2_MEMORY_AVAILABLE` = 1) — passed to `pmm_init()` |
+
+The `multiboot2_next_tag` macro advances the tag pointer by the current tag's `size` rounded up to the next 8-byte boundary:
+
+```c
+#define MULTIBOOT2_TAG_ALIGN 8
+#define multiboot2_next_tag(tag) \
+    ((struct multiboot2_tag *)((uint8_t *)(tag) + \
+        (((tag)->size + (MULTIBOOT2_TAG_ALIGN - 1)) & ~(MULTIBOOT2_TAG_ALIGN - 1))))
+```
+
+## Boot menu
+
+After all hardware is initialised, `kernel_main` draws a graphical boot menu directly to the framebuffer before starting the desktop or shell. The menu offers two options rendered as highlighted rectangles:
+
+```
+        SilverOS Boot Menu
+
+  ┌──────────────────────────────┐
+  │  1. Start SilverOS Desktop   │  ← highlighted in blue when selected
+  └──────────────────────────────┘
+     2. Start Minimal Shell
+
+        Use Up/Down and Enter
+```
+
+The selection loop reads from the keyboard ring buffer using `keyboard_getchar_nb()` (non-blocking) and calls `fb_swap_buffers()` each iteration so the highlight is always visible:
+
+- **Up / Down arrows** — toggle between options 1 and 2.
+- **Enter** — confirm the highlighted choice.
+- **`1` / `2`** — jump directly to that option.
+
+Choosing option 1 plays the boot animation (`bootanim_play()`) and enters `desktop_run()`. Choosing option 2 skips the animation and drops to a text login prompt backed by `user_login()`. Both paths are terminal — neither ever returns to `kernel_main`.

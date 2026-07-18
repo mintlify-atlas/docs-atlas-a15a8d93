@@ -1,0 +1,98 @@
+---
+title: "PIT Timer and Tick-Based Delays in SilverOS"
+sidebarTitle: "Timers"
+description: "SilverOS programs the 8253/8254 PIT via timer_init to fire at a configurable frequency and exposes sleep_ms and timer_get_ticks for timing and delays."
+---
+
+SilverOS uses the Intel 8253/8254 Programmable Interval Timer (PIT) as its sole time source. At boot, `timer_init` programs channel 0 of the PIT to fire IRQ0 at a chosen frequency, wiring the interrupt to an internal handler that increments a monotonic 64-bit tick counter. Everything in the kernel that needs to measure elapsed time or insert a delay — the terminal cursor blink, frame pacing, boot-time waits — reads from or blocks on that counter.
+
+## Timer API
+
+```c
+void     timer_init(uint32_t frequency); /* programs PIT at given Hz */
+void     sleep_ms(uint32_t ms);          /* busy-wait delay in milliseconds */
+uint64_t timer_get_ticks(void);          /* returns total tick count since init */
+```
+
+## Initialisation
+
+SilverOS calls `timer_init(1000)` during early kernel startup, producing a tick rate of 1000 Hz — one tick per millisecond. The PIT channel 0 input clock runs at a fixed 1.193182 MHz; dividing by the requested frequency gives the 16-bit reload value written to the channel 0 data port (`0x40`).
+
+The command byte `0x36` selects channel 0, lobyte/hibyte access mode, and mode 3 (square wave generator), which is the standard rate-generator mode used by PC-compatible operating systems.
+
+```c
+/* Registered in timer_init: */
+void timer_init(uint32_t frequency) {
+    uint32_t divisor = 1193182 / frequency;
+    outb(0x43, 0x36);                   /* channel 0, mode 3, binary */
+    outb(0x40, divisor & 0xFF);         /* low byte */
+    outb(0x40, (divisor >> 8) & 0xFF);  /* high byte */
+    idt_set_handler(32, timer_handler);
+    pic_clear_mask(0);                  /* unmask IRQ0 */
+}
+```
+
+After programming the PIT, `timer_init` registers the internal `timer_handler` on vector 32 (IRQ0) via `idt_set_handler(32, timer_handler)` and unmasks IRQ0 with `pic_clear_mask(0)`. The handler itself is intentionally minimal — it increments the `timer_ticks` counter and sends the PIC an end-of-interrupt signal:
+
+```c
+static void timer_handler(struct interrupt_frame *frame) {
+    (void)frame;
+    timer_ticks++;
+    pic_send_eoi(0);
+}
+```
+
+The `timer_ticks` variable is declared `volatile` to prevent the compiler from caching it in a register across the polling loop in `sleep_ms`.
+
+## sleep_ms
+
+`sleep_ms` calculates a target tick value based on the current counter and spins until the counter reaches or exceeds it:
+
+```c
+void sleep_ms(uint32_t ms) {
+    uint64_t target = timer_ticks + (ms * timer_freq / 1000);
+    while (timer_ticks < target) {
+        __asm__ volatile ("hlt");
+    }
+}
+```
+
+The `hlt` instruction inside the loop halts the CPU until the next interrupt — in this case the next PIT tick — which prevents the spin from consuming 100 % of the CPU's power budget while waiting. At 1000 Hz, each tick is exactly 1 ms, so `sleep_ms(n)` waits for approximately `n` ticks.
+
+<Note>
+`sleep_ms` is a busy-wait: it does not yield to another task. SilverOS has no scheduler, so the calling code is the only thing running; there is nothing else to yield to. Any code that calls `sleep_ms` for long durations (e.g. more than a few hundred milliseconds) will block all other kernel activity, including IRQ processing if `hlt` is not used. The `hlt` in the loop body allows IRQs to fire normally while the wait is in progress.
+</Note>
+
+## timer_get_ticks
+
+`timer_get_ticks` returns the raw value of the internal `timer_ticks` counter as a `uint64_t`. The counter starts at zero when `timer_init` is called and increments by one on every IRQ0.
+
+At 1000 Hz, a `uint64_t` counter overflows after approximately 584 million years, making overflow a non-concern in practice.
+
+The SilverOS desktop shell uses `timer_get_ticks` directly for the blinking cursor effect. Dividing the tick count by 500 gives a value that changes every 500 ms; taking it modulo 2 produces an alternating 0/1 toggle:
+
+```c
+if ((timer_get_ticks() / 500) % 2 == 0) {
+    /* cursor is visible this half-second */
+}
+```
+
+## Usage Example
+
+```c
+/* Wait 16 ms (~60 FPS frame pacing) */
+sleep_ms(16);
+
+/* Blinking cursor toggle (on/off every 500 ms) */
+if ((timer_get_ticks() / 500) % 2 == 0) {
+    /* draw cursor */
+}
+```
+
+For boot-time delays — for example, waiting for a PS/2 device to reset — `sleep_ms` can be called before the graphics subsystem is active:
+
+```c
+/* Reset PS/2 controller and wait for it to stabilise */
+outb(0x64, 0xFF);
+sleep_ms(10);
+```

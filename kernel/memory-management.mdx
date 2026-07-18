@@ -1,0 +1,84 @@
+---
+title: "Physical Memory Manager and Kernel Heap in SilverOS"
+sidebarTitle: "Memory Management"
+description: "SilverOS manages physical pages with a flat bitmap allocator and provides kernel dynamic memory via a linked-list heap. Full API reference for pmm and heap."
+---
+
+SilverOS manages memory in two distinct layers. The Physical Memory Manager (PMM) operates at page granularity, keeping track of which 4 KB frames are in use across the entire address space using a flat bitmap. On top of that, the kernel heap provides the familiar `kmalloc`/`kfree` interface for variable-size allocations within a fixed 4 MB region. Neither layer involves virtual memory or page tables — all addresses are physical, and the kernel runs identity-mapped.
+
+## Physical Memory Manager
+
+`pmm_init` is called early in boot with the Multiboot2 memory map tag, the kernel's own start and end addresses, and the total detected memory size. It begins by marking every page as reserved (`memset(bitmap, 0xFF, ...)`), then walks the Multiboot2 memory map and clears the bitmap bit for each page in an `AVAILABLE` region, skipping any page below `kernel_end` or below `0x200000` (2 MB). This permanently reserves the first 2 MB, the kernel image, and all Multiboot structures.
+
+The bitmap itself is a 128 KB static array — one bit per 4 KB page, covering up to 4 GB (1 048 576 pages total).
+
+```c
+#define PAGE_SIZE 4096
+
+void     pmm_init(uint64_t mem_size,
+                  struct multiboot2_tag_mmap *mmap_tag,
+                  uint64_t kernel_start,
+                  uint64_t kernel_end);
+void    *pmm_alloc_page(void);       /* allocates one 4 KB page, zeroed */
+void     pmm_free_page(void *addr);  /* frees a 4 KB page by address */
+uint64_t pmm_get_free_pages(void);   /* returns count of free pages */
+```
+
+**`pmm_alloc_page`** performs a linear scan of the bitmap from index 0 upward, finds the first clear bit, marks it used, decrements `free_pages`, and zeroes the returned page with `memset`. It returns `NULL` when no free pages remain.
+
+**`pmm_free_page`** converts the physical address back to a page index and clears the corresponding bit, incrementing `free_pages`. It is a no-op if the address is out of range or if the page is already marked free — double-frees are silently ignored.
+
+<Warning>
+`pmm_alloc_page` returns `NULL` on out-of-memory. Every caller must check the return value before dereferencing or passing the result to the heap. Failing to do so will cause a null-pointer write that corrupts physical page 0 (the real-mode IVT / BIOS data area) and will produce unpredictable behaviour.
+</Warning>
+
+## Kernel Heap
+
+The heap is a contiguous region of physical memory managed with a singly-linked list of `heap_block` header nodes embedded immediately before each allocation. Each node records the usable byte count (`size`), a boolean `free` flag, and a pointer to the next block. Allocations are 16-byte aligned via the `ALIGN_UP` macro.
+
+`heap_init` is called once with a base address and byte size. SilverOS passes `HEAP_START = 0x1000000` (16 MB) and `HEAP_SIZE = 4 MB`:
+
+```c
+void  heap_init(void *start, size_t size);
+void *kmalloc(size_t size);               /* first-fit allocation, 16-byte aligned */
+void *kcalloc(size_t count, size_t size); /* allocates and zeroes count*size bytes */
+void *krealloc(void *ptr, size_t new_size);
+void  kfree(void *ptr);                   /* frees, coalesces adjacent free blocks */
+```
+
+**`kmalloc(size)`** — First-fit search. When a suitable block is found, `split_block` divides it if the surplus is at least 64 bytes plus one header's worth; otherwise the entire block is handed out. Returns `NULL` for `size == 0` or when the heap is exhausted.
+
+**`kcalloc(count, size)`** — Multiplies `count` by `size`, calls `kmalloc`, and zeroes the result with `memset`. Returns `NULL` on failure.
+
+**`krealloc(ptr, new_size)`** — If `ptr` is `NULL`, behaves identically to `kmalloc(new_size)`. If `new_size` is 0, frees `ptr` and returns `NULL`. If the existing block is already large enough, the original pointer is returned unchanged. Otherwise a new block is allocated, the old contents are copied with `memcpy`, and the old block is freed.
+
+**`kfree(ptr)`** — Marks the block free and immediately attempts to coalesce it with the following block and with the preceding block, preventing heap fragmentation over time. `kfree(NULL)` is a safe no-op.
+
+<Warning>
+`kmalloc` returns `NULL` on OOM. All kernel code must check the return value before use. Because SilverOS has no virtual memory or swap, there is no recovery path once the 4 MB heap is exhausted — the next attempted allocation of the same type will also fail.
+</Warning>
+
+## Checking Available Memory
+
+`pmm_get_free_pages` returns the live count of unallocated physical pages. The terminal `free` command converts this to megabytes using the same formula:
+
+```c
+uint64_t free = pmm_get_free_pages();
+uint64_t free_mb = (free * PAGE_SIZE) / (1024 * 1024);
+```
+
+At boot, the free page count is reported by `pmm_init` over the serial port:
+
+```
+[PMM] Initialized: N total pages tracked, M free pages (X MB free)
+```
+
+## Limitations
+
+The current memory subsystem is intentionally minimal:
+
+- **No virtual memory or page tables.** There is no VMM layer, no `mmap`, and no address-space isolation between kernel components. Every pointer is a raw physical address.
+- **No memory-mapped I/O abstraction.** Drivers access MMIO regions directly by casting physical addresses to pointers. There is no `ioremap` equivalent.
+- **Heap is fixed at 4 MB.** The heap cannot grow. Once `heap_init` is called, the usable kernel heap is bounded by the size passed at initialisation time.
+- **PMM bitmap covers at most 4 GB.** Systems with more than 4 GB of RAM will have all memory above 4 GB permanently inaccessible to the PMM.
+- **No NUMA awareness.** The linear bitmap scan always allocates from the lowest available physical address regardless of memory topology.

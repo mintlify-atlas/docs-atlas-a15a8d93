@@ -1,0 +1,127 @@
+---
+title: "SilverOS Network Stack: RTL8139, ARP, IPv4, and ICMP"
+sidebarTitle: "Overview"
+description: "SilverOS includes a minimal network stack built on an RTL8139 Ethernet driver, supporting ARP resolution, IPv4 packet I/O, and ICMP ping requests and replies."
+---
+
+SilverOS ships a purpose-built network stack layered directly over bare-metal x86\_64 hardware. Starting from PCI enumeration and RTL8139 NIC initialisation, the stack climbs through Ethernet II framing, ARP address resolution, and IPv4 routing, up to ICMP echo request and reply handling. There is no operating-system abstraction between your code and the wire — every received frame is dispatched in the RTL8139 IRQ handler and every outbound byte is written directly to an I/O-mapped transmit buffer.
+
+## Stack architecture
+
+The stack is split into five focused layers, each living in its own source file:
+
+| Layer | Component | File |
+|---|---|---|
+| Hardware | RTL8139 NIC driver | `drivers/rtl8139.c` |
+| Data Link | Ethernet II framing | `net/ethernet.c` |
+| Network | ARP + IPv4 | `net/arp.c`, `net/ipv4.c` |
+| Transport/App | ICMP (ping) | `net/icmp.c` |
+| Coordination | net\_init, net\_receive\_packet | `net/net.c` |
+
+Each layer exposes a small C API declared in `include/net.h`. The RTL8139 driver is the only component that touches I/O ports directly; all higher layers communicate exclusively through the functions exported by the layers beneath them.
+
+## RTL8139 driver
+
+SilverOS detects the RTL8139 NIC during boot by scanning the PCI bus for vendor ID `0x10EC` and device ID `0x8139`. Once found, `rtl8139_init` reads the I/O base address from BAR0, enables bus mastering, resets the chip, reads the MAC address from the NIC's I/O registers, configures the receive ring buffer, and hooks the card's PCI interrupt line into the IDT.
+
+When running under QEMU, the card can be emulated by passing the following flag:
+
+```bash
+-nic user,model=rtl8139
+```
+
+The driver exposes a minimal public API:
+
+```c
+void    rtl8139_init(void);                            /* detects via PCI, configures NIC */
+void    rtl8139_send_packet(void *data, uint32_t len); /* sends raw Ethernet frame */
+extern uint8_t rtl8139_mac[6];                         /* NIC's MAC address */
+```
+
+`rtl8139_mac` is populated by `rtl8139_init` and is read by `ethernet_send` to fill the source MAC field of every outgoing Ethernet frame.
+
+<Note>
+  The RTL8139 IRQ handler in `drivers/rtl8139.c` currently has the call to `net_receive_packet` commented out (`// net_receive_packet(packet, packet_len);`). Uncomment this line to connect the hardware receive path to the upper-layer stack.
+</Note>
+
+## Network initialisation
+
+The boot sequence in `kernel_main` must set up PCI, the NIC, and the network stack in order:
+
+```c
+/* In kernel_main: */
+pci_scan_bus();
+rtl8139_init();
+net_init();     /* calls arp_init(), logs IP address */
+```
+
+`net_init` zeroes the ARP cache and prints the local IP address to serial output. The default address is `10.0.2.15`, which is the IP QEMU assigns to the guest under its user-mode networking:
+
+```c
+ip_addr_t  net_my_ip    = {10, 0, 2, 15};
+mac_addr_t net_bcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+```
+
+Both globals are declared in `net/net.c` and are `extern`-visible to every other network module via `include/net.h`.
+
+## Receiving packets
+
+When the RTL8139 signals a receive interrupt, the IRQ handler reads the raw Ethernet frame out of the ring buffer and passes it — pointer and byte length — to:
+
+```c
+void net_receive_packet(void *data, uint16_t len);
+```
+
+`net_receive_packet` (in `net/net.c`) strips the 14-byte Ethernet II header and dispatches the payload based on the EtherType field:
+
+- `0x0806` → `arp_handle_packet(payload, payload_len)`
+- `0x0800` → `ipv4_handle_packet(payload, payload_len)`
+- Any other EtherType is silently ignored.
+
+Packets shorter than 14 bytes (`sizeof(ethernet_header_t)`) are dropped immediately before the EtherType check.
+
+## Sending packets
+
+All outbound traffic goes through `ethernet_send`, which lives in `net/ethernet.c`. It prepends a 14-byte Ethernet II header — filling `dest` from the caller, `src` from `rtl8139_mac`, and `type` converted to network byte order — then copies the payload into a local `1536`-byte frame buffer and hands it to `rtl8139_send_packet`:
+
+```c
+/* ethernet_send wraps payload in an Ethernet II header and calls rtl8139_send_packet */
+void ethernet_send(mac_addr_t dest, uint16_t type,
+                   void *payload, uint16_t payload_len);
+```
+
+Higher layers (ARP, IPv4) never call `rtl8139_send_packet` directly; they always go through `ethernet_send`.
+
+## Endianness helpers
+
+The network wire format is big-endian; x86\_64 is little-endian. `include/net.h` provides four inline helpers that handle the conversion without any external dependency:
+
+```c
+static inline uint16_t htons(uint16_t v) { return (v >> 8) | (v << 8); }
+static inline uint16_t ntohs(uint16_t v) { return (v >> 8) | (v << 8); }
+static inline uint32_t htonl(uint32_t v) {
+    return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
+}
+static inline uint32_t ntohl(uint32_t v) { return htonl(v); }
+```
+
+`htons`/`ntohs` swap the two bytes of a 16-bit value; `htonl`/`ntohl` swap all four bytes of a 32-bit value. Because byte-swapping is its own inverse, the host-to-network and network-to-host variants are identical.
+
+## Checksum
+
+Both IPv4 headers and ICMP messages are protected by a one's-complement internet checksum, computed by `net_checksum` in `net/net.c`:
+
+```c
+uint16_t net_checksum(void *data, int len);
+/* One's complement sum over 16-bit words — used by IPv4 and ICMP */
+```
+
+The function sums consecutive 16-bit words, folds any carry out of the top 16 bits back into the low 16 bits, and returns the bitwise complement. Callers zero the checksum field in the header before passing the buffer, then write the returned value back into that field.
+
+<Note>
+  SilverOS has no UDP or TCP implementation. The network stack is intentionally minimal — ARP, IPv4, and ICMP form a foundation that proves the hardware path works end-to-end and can respond to pings. Higher-level transport protocols can be added on top of `ipv4_send` and `ipv4_handle_packet` by registering additional protocol numbers.
+</Note>
+
+<Tip>
+  Every significant network event — NIC initialisation, IP assignment, ARP exchanges, ICMP requests, and ICMP replies — is logged to the serial port via `serial_printf`. Run QEMU with `-serial stdio` (already wired into the `make run` target) to watch the full packet flow in your terminal in real time.
+</Tip>

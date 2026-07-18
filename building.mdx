@@ -1,0 +1,106 @@
+---
+title: "Build SilverOS from Source on Linux"
+sidebarTitle: "Building"
+description: "Install the required toolchain, clone the repo, and compile SilverOS into a bootable ISO and SilverFS virtual disk image with a single make command."
+---
+
+SilverOS uses a straightforward GNU Make build system. A single `make` invocation compiles every Assembly and C source file, links the kernel binary, formats the SilverFS virtual disk image, and optionally wraps everything into a bootable GRUB2 ISO — all without any configure step or external build framework. The Makefile is self-contained and documents every compiler and linker flag it uses.
+
+## Prerequisites
+
+You will need a standard Linux host with the following packages installed. All are available in the default repositories of any Debian/Ubuntu-based distribution.
+
+```bash
+sudo apt install \
+    gcc \
+    nasm \
+    binutils \
+    grub-pc-bin \
+    grub-common \
+    xorriso \
+    qemu-system-x86
+```
+
+| Package | Role |
+|---------|------|
+| `gcc` | C compiler — builds all `.c` sources with `-std=gnu11` |
+| `nasm` | NASM assembler — builds `boot/boot.asm` and the two kernel Assembly helpers |
+| `binutils` (`ld`) | GNU linker — links all objects using `boot/linker.ld` |
+| `grub-pc-bin` + `grub-common` | Provides `grub-mkrescue` and `grub-file` for ISO creation and header verification |
+| `xorriso` | Required by `grub-mkrescue` to produce a hybrid El Torito ISO |
+| `qemu-system-x86` | QEMU x86_64 emulator for running SilverOS locally |
+
+## Build targets
+
+| Target | Command | Output |
+|--------|---------|--------|
+| Default build | `make` or `make all` | `build/silveros.bin` (kernel ELF binary) + `build/disk.svd` (SilverFS disk image) |
+| Bootable ISO | `make iso` | `build/silveros.iso` — GRUB2 hybrid ISO containing the kernel and GRUB config |
+| Disk image only | `make disk` | `build/disk.svd` — formatted SilverFS virtual disk, created by the host tool `build/mkfs_svd` |
+| Run in QEMU | `make run` | Builds ISO + disk, then launches QEMU with KVM enabled; automatically falls back to software emulation if KVM is unavailable |
+| Run without KVM | `make run-nokvm` | Same as `make run` but always uses software emulation — useful on systems without hardware virtualization |
+| Flash to USB | `make usb DEV=/dev/sdX` | Writes the ISO to the target block device at offset 0, then appends the SilverFS disk at a 64 MB offset |
+| Clean | `make clean` | Removes the entire `build/` directory |
+| Verify header | `make check` | Runs `grub-file --is-x86-multiboot2` against the kernel binary to confirm the Multiboot2 header is valid |
+
+<Warning>
+  `make usb DEV=/dev/sdX` uses `dd` to write directly to a block device with `sudo`. It will **destructively and permanently overwrite** all data on the target drive. Double-check your device path before running this command.
+</Warning>
+
+## Compiler flags
+
+The Makefile toolchain variables are:
+
+```makefile
+ASM      = nasm
+CC       = gcc
+LD       = ld
+GRUB_MK  = grub-mkrescue
+
+ASMFLAGS = -f elf64
+CFLAGS   = -ffreestanding -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+           -mcmodel=kernel -Wall -Wextra -O2 -I include -std=gnu11 \
+           -fno-stack-protector -fno-pic -fno-pie -c
+LDFLAGS  = -T boot/linker.ld -nostdlib -z max-page-size=0x1000
+```
+
+Here is what each non-obvious flag does:
+
+| Flag | Reason |
+|------|--------|
+| `-ffreestanding` | Tells GCC not to assume a hosted C environment — no `libc`, no `crt0`, no startup files |
+| `-mno-red-zone` | Disables the x86_64 "red zone" (128-byte scratch area below RSP). Required in kernel code because hardware interrupts can fire at any time and would corrupt an active red zone |
+| `-mno-mmx -mno-sse -mno-sse2` | Prevents the compiler from emitting SSE/MMX instructions. The kernel does not save or restore the FPU/SIMD register state on context switches, so SSE use in kernel code would silently corrupt those registers |
+| `-mcmodel=kernel` | Selects the kernel code model, which assumes the kernel is mapped in the upper 2 GB of the 64-bit address space and generates appropriate relocations |
+| `-fno-stack-protector` | Disables stack canary insertion — there is no `__stack_chk_fail` symbol in a freestanding build |
+| `-fno-pic -fno-pie` | Disables position-independent code generation. The kernel is linked at a fixed physical address and does not use a GOT/PLT |
+| `-O2 -Wall -Wextra` | Standard optimization level with full warnings enabled |
+| `-std=gnu11` | C11 with GNU extensions (used for `typeof`, statement expressions, and similar GCC-specific constructs) |
+| `-nostdlib` (linker) | Do not link against any standard libraries or startup files |
+| `-z max-page-size=0x1000` | Sets the maximum ELF segment alignment to 4 KB, preventing the linker from over-aligning sections and wasting physical address space |
+
+## Build output
+
+After a successful build the `build/` directory contains:
+
+```
+build/
+├── silveros.bin       # Linked kernel binary (Multiboot2 ELF)
+├── silveros.iso       # Bootable GRUB2 hybrid ISO  (make iso)
+├── disk.svd           # SilverFS virtual disk image
+├── mkfs_svd           # Host-side disk formatter (native Linux binary)
+├── boot/
+│   └── boot.o         # Compiled boot stub
+├── kernel/
+│   └── *.o            # Compiled kernel objects
+├── drivers/
+│   └── *.o
+├── fs/
+│   └── silverfs.o
+├── net/
+│   └── *.o
+└── desktop/
+    └── *.o
+```
+
+The kernel binary `build/silveros.bin` is what GRUB loads via the `multiboot2` directive in `boot/grub.cfg`. The ISO embeds this binary alongside the GRUB configuration at `boot/grub/grub.cfg` inside the ISO filesystem.

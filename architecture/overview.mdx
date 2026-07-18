@@ -1,0 +1,97 @@
+---
+title: "SilverOS Architecture: Subsystems and Source Layout"
+sidebarTitle: "Overview"
+description: "A high-level map of SilverOS subsystems — kernel, drivers, filesystem, networking, desktop — and how they connect at runtime and in the source tree."
+---
+
+SilverOS is a bare-metal x86\_64 operating system written in C and Assembly. This page provides a high-level map of how the system is structured: which subsystems exist, how they depend on each other, where to find them in the source tree, and the order in which `kernel_main` brings them online. For detailed boot mechanics see [Boot Sequence](/architecture/boot), and for memory internals see [Memory](/architecture/memory).
+
+## Subsystem map
+
+SilverOS is organised into six horizontal layers. Each layer depends only on the layers beneath it.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 5 — User Interface                                       │
+│  desktop environment · window manager · file browser · terminal │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 4 — Services                                             │
+│  SilverFS · network stack (IPv4/ARP/ICMP) · console            │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 3 — Drivers                                              │
+│  framebuffer · keyboard · mouse · ATA · RTC · RTL8139           │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 2 — Memory                                               │
+│  PMM bitmap allocator → heap allocator (kmalloc/kfree)          │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 1 — Hardware Abstraction                                 │
+│  GDT · IDT · PIC · PCI · serial                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 0 — Boot                                                 │
+│  GRUB2 → Multiboot2 → boot.asm entry stub → kernel_main        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Layer | Subsystems | Notes |
+|-------|-----------|-------|
+| **0 — Boot** | GRUB2, Multiboot2 header, `boot.asm` | GRUB2 loads the kernel ELF at 1 MB, passes a Multiboot2 info struct, and transfers control to `_start` in `boot.asm`. The assembly stub sets up identity-mapped page tables, enables long mode, and calls `kernel_main`. |
+| **1 — HAL** | GDT, IDT, PIC, PCI, serial | The global descriptor table, interrupt descriptor table, and 8259 PIC are initialised before any driver or allocator. The serial port is the very first subsystem initialised (used for debug output throughout boot). |
+| **2 — Memory** | PMM, heap | The physical memory manager builds a bitmap from the Multiboot2 memory map, then the heap allocator is placed at a fixed 16 MB base. All higher layers call `kmalloc`/`kfree` — nothing else touches physical pages directly. |
+| **3 — Drivers** | framebuffer, font, keyboard, mouse, ATA, RTC, RTL8139 | Device drivers talk to hardware through I/O ports or MMIO. They depend on Layer 1 (interrupts, PCI enumeration) and Layer 2 (dynamic allocation). |
+| **4 — Services** | SilverFS, network stack, console | Higher-level services built on top of drivers. SilverFS mounts an ATA disk image; the network stack processes Ethernet frames from the RTL8139. |
+| **5 — UI** | desktop, window manager, file browser, terminal | The desktop environment renders windows directly to the framebuffer. The minimal shell reuses the console service and SilverFS for the `ls` builtin. |
+
+## Source tree
+
+| Directory | Purpose |
+|-----------|---------|
+| `boot/` | `boot.asm` — Multiboot2 header + assembly entry stub; `linker.ld` — places kernel at 1 MB, exports `_kernel_start`/`_kernel_end`; `grub.cfg` — GRUB2 menu configuration |
+| `kernel/` | `kernel.c` — `kernel_main` entry point and init sequence; `gdt.c`, `idt.c`, `pic.c` — hardware abstraction; `timer.c` — programmable interval timer; `pmm.c` — bitmap physical memory manager; `heap.c` — linked-list heap; `string.c` — `memset`/`memcpy`/`strcmp`; `serial.c` — debug UART; `user.c` — user account store; `pci.c` — PCI bus scan |
+| `drivers/` | `framebuffer.c` — VESA framebuffer with double-buffering; `font.c` — PSF/bitmap font renderer; `keyboard.c` — PS/2 keyboard with scancode translation; `mouse.c` — PS/2 mouse; `bootanim.c` — boot animation; `console.c` — text console over framebuffer; `ata.c` — PIO ATA disk driver; `rtc.c` — CMOS real-time clock; `rtl8139.c` — RTL8139 NIC driver |
+| `fs/` | `silverfs.c` — SilverFS (SVD disk format) mount, format, and directory/file operations |
+| `net/` | `net.c` — network stack entry point; `ethernet.c` — Ethernet II frame handling; `arp.c` — ARP request/reply; `ipv4.c` — IPv4 datagram processing; `icmp.c` — ICMP echo (ping) |
+| `desktop/` | `desktop.c` — window manager and desktop shell (login screen → taskbar → icon grid); `filebrowser.c` — graphical file browser widget |
+| `include/` | All public C headers — one header per subsystem |
+| `tools/` | `mkfs_svd.c` — host-side tool to create SilverFS disk images |
+| `build/` | Compiler output directory (not tracked in source control) |
+
+## Kernel init sequence
+
+`kernel_main` in `kernel/kernel.c` initialises every subsystem in a strict ten-phase sequence. The order is dictated by dependency: later phases assume all earlier phases have succeeded.
+
+<Steps>
+  <Step title="Serial init">
+    `serial_init()` brings up the COM1 UART at 115 200 baud. All subsequent `serial_printf` calls provide a live debug log independent of the framebuffer.
+  </Step>
+  <Step title="Multiboot2 parsing">
+    The Multiboot2 info struct is walked tag-by-tag. Three tags are extracted and cached: **type 8** (framebuffer address, dimensions, bpp), **type 4** (basic memory sizes), and **type 6** (full memory map needed by PMM). An invalid magic value causes an immediate halt.
+  </Step>
+  <Step title="Framebuffer + console init">
+    `fb_init(fb_tag)` maps the linear framebuffer. `console_init()` layers a text console on top. The first `kprintf` output appears on screen here.
+  </Step>
+  <Step title="GDT, PIC, IDT">
+    The 64-bit Global Descriptor Table is reloaded, the 8259 PIC is remapped to vectors 0x20–0x2F, and the Interrupt Descriptor Table is populated with handlers. Interrupts are **not** enabled yet.
+  </Step>
+  <Step title="PMM + heap">
+    `pmm_init()` builds the page bitmap from the Multiboot2 memory map, reserving the first 2 MB and the kernel image. `heap_init()` places a 4 MB heap at `HEAP_START = 0x1000000` (16 MB physical). `kmalloc` becomes available from this point.
+  </Step>
+  <Step title="Keyboard, mouse, interrupts enabled">
+    PS/2 keyboard and mouse controllers are initialised, then `sti()` enables hardware interrupts for the first time.
+  </Step>
+  <Step title="Timer (1000 Hz)">
+    `timer_init(1000)` programs the PIT to fire IRQ 0 at 1 kHz, providing the system tick used by the scheduler, animation, and timeouts.
+  </Step>
+  <Step title="PCI scan, RTL8139, network stack">
+    `pci_scan_bus()` enumerates all PCI devices. If an RTL8139 NIC is found, `rtl8139_init()` configures it. `net_init()` initialises the Ethernet/ARP/IPv4/ICMP stack on top.
+  </Step>
+  <Step title="ATA + SilverFS mount">
+    `ata_init()` probes the primary ATA bus. `silverfs_mount()` attempts to mount the SVD filesystem from the disk. If the disk is absent or the superblock is invalid, `silverfs_format()` creates a fresh filesystem and mounts again.
+  </Step>
+  <Step title="RTC, user system, boot menu → desktop or shell">
+    `rtc_init()` reads the hardware clock. `user_init()` loads the user account store. A graphical boot menu lets the operator choose between the full desktop environment (option 1) or the minimal text shell (option 2). The desktop path plays a boot animation then enters `desktop_run()`, which never returns. The shell path loops on `keyboard_getchar_nb()` processing built-in commands (`help`, `ls`, `clear`, `reboot`).
+  </Step>
+</Steps>
+
+## Memory map
+
+The kernel binary is loaded by GRUB at **1 MB physical** (address `0x00100000`). The linker exports `_kernel_start` and `_kernel_end` symbols that the PMM uses to mark kernel pages as reserved. The kernel heap is placed well above the kernel image at **`HEAP_START = 0x1000000`** (16 MB), with a fixed size of 4 MB (`HEAP_SIZE = 4 * 1024 * 1024`). Full details of the physical memory layout, the PMM bitmap design, and heap internals are covered in [Memory](/architecture/memory).

@@ -1,0 +1,138 @@
+---
+title: "ATA PIO Storage and Real-Time Clock Drivers"
+sidebarTitle: "Storage"
+description: "SilverOS accesses the virtual ATA disk with PIO sector reads and writes, and reads wall-clock time from the CMOS RTC. Full API reference for ata and rtc."
+---
+
+SilverOS provides two low-level hardware access drivers for persistent data: the ATA PIO driver for block storage and the Real-Time Clock (RTC) driver for wall-clock time. Both are intentionally minimal — ATA uses blocking Programmed I/O rather than DMA, and the RTC reads CMOS registers directly through I/O ports 0x70 and 0x71. A third supporting driver, the PCI bus scanner, runs at boot to enumerate attached devices and is documented here because it underpins future storage expansion.
+
+## ATA PIO driver
+
+The ATA driver communicates with the primary IDE bus using the standard PC AT register set. All transfers are performed in PIO mode: the CPU reads or writes 16-bit words directly from the data register in a loop. 28-bit Logical Block Addressing (LBA) is used to address sectors, supporting disks up to 128 GiB.
+
+All port addresses, status flag masks, command codes, and functions are declared in `ata.h`:
+
+```c
+/* Primary ATA bus ports */
+#define ATA_PORT_DATA      0x1F0
+#define ATA_PORT_ERROR     0x1F1
+#define ATA_PORT_FEATURES  0x1F1
+#define ATA_PORT_SECCOUNT  0x1F2
+#define ATA_PORT_LBA_LO    0x1F3
+#define ATA_PORT_LBA_MID   0x1F4
+#define ATA_PORT_LBA_HI    0x1F5
+#define ATA_PORT_DRIVE     0x1F6
+#define ATA_PORT_STATUS    0x1F7
+#define ATA_PORT_COMMAND   0x1F7
+#define ATA_PORT_ALTSTATUS 0x3F6
+
+/* Status bits */
+#define ATA_SR_BSY  0x80  /* Drive busy */
+#define ATA_SR_DRDY 0x40  /* Drive ready */
+#define ATA_SR_DRQ  0x08  /* Data request ready */
+#define ATA_SR_ERR  0x01  /* Error */
+
+/* Commands */
+#define ATA_CMD_READ_PIO    0x20
+#define ATA_CMD_WRITE_PIO   0x30
+#define ATA_CMD_CACHE_FLUSH 0xE7
+
+#define ATA_SECTOR_SIZE 512  /* bytes per sector */
+
+void ata_init(void);
+void ata_read_sector(uint32_t lba, uint8_t *buffer);
+void ata_write_sector(uint32_t lba, const uint8_t *buffer);
+void ata_read_sectors(uint32_t lba, uint8_t count, uint8_t *buffer);
+void ata_write_sectors(uint32_t lba, uint8_t count, const uint8_t *buffer);
+```
+
+| Function | Description |
+|---|---|
+| `ata_init` | Selects the master drive on the primary bus, waits for `ATA_SR_DRDY`, and logs the result. |
+| `ata_read_sector` | Reads exactly 512 bytes from the sector at `lba` into `buffer`. Blocks while `ATA_SR_BSY` is set. |
+| `ata_write_sector` | Writes 512 bytes from `buffer` to the sector at `lba`. Issues `ATA_CMD_CACHE_FLUSH` after the transfer to commit the data. |
+| `ata_read_sectors` | Reads `count` consecutive 512-byte sectors starting at `lba`. Equivalent to calling `ata_read_sector` in a loop but issues a single multi-sector command for efficiency. |
+| `ata_write_sectors` | Writes `count` consecutive sectors. Issues a cache flush after all sectors are transferred. |
+
+`ATA_PORT_STATUS` and `ATA_PORT_COMMAND` share the same address (0x1F7): reads return the status register, writes send commands. `ATA_PORT_ALTSTATUS` (0x3F6) provides the same status information without clearing a pending interrupt, and is used for busy-waiting to avoid consuming the IRQ.
+
+<Note>
+  The ATA driver is fully polled (blocking PIO) — there is no interrupt-driven DMA path. The CPU spins reading `ATA_PORT_ALTSTATUS` until `ATA_SR_BSY` clears and `ATA_SR_DRQ` sets before each 256-word transfer. Sequential reads of large files are fast enough for the filesystem workloads SilverOS targets, but many small random reads in a tight loop will noticeably stall the system.
+</Note>
+
+## Reading and writing sectors
+
+The unit of transfer is always 512 bytes (`ATA_SECTOR_SIZE`). Provide a correctly sized buffer:
+
+```c
+uint8_t buf[512];
+ata_read_sector(0, buf);   /* read LBA 0 (first sector) */
+
+/* Write 2 sectors starting at LBA 10 */
+uint8_t data[1024];
+ata_write_sectors(10, 2, data);
+```
+
+LBA 0 is the first sector on the disk (typically the boot record or partition table). The SilverFS filesystem driver calls `ata_read_sectors` and `ata_write_sectors` for all file and directory operations.
+
+## PCI device enumeration
+
+At kernel boot, `pci_scan_bus()` probes all 256 PCI buses, 32 device slots, and 8 functions per slot by reading the vendor/device ID from each PCI configuration space header. Any non-0xFFFF vendor ID indicates a present device and is logged to the serial port. The PCI API is declared in `pci.h`:
+
+```c
+uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
+void     pci_write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
+                          uint32_t value);
+
+void     pci_scan_bus(void);
+int      pci_find_device(uint16_t vendor_id, uint16_t device_id,
+                         uint8_t *bus_out, uint8_t *slot_out, uint8_t *func_out);
+uint32_t pci_get_bar(uint8_t bus, uint8_t slot, uint8_t func, int bar);
+void     pci_enable_bus_mastering(uint8_t bus, uint8_t slot, uint8_t func);
+uint8_t  pci_get_interrupt_line(uint8_t bus, uint8_t slot, uint8_t func);
+```
+
+| Function | Description |
+|---|---|
+| `pci_read_config` | Issues a 32-bit read from PCI configuration space using I/O ports 0xCF8 (address) and 0xCFC (data). `offset` must be 4-byte aligned. |
+| `pci_write_config` | Issues a 32-bit write to PCI configuration space. Used to set command register bits such as bus mastering. |
+| `pci_scan_bus` | Probes all bus/slot/function combinations and logs discovered devices to serial. Called once during boot. |
+| `pci_find_device` | Searches for a device matching `vendor_id` and `device_id`. Returns 0 on success and fills `bus_out`, `slot_out`, `func_out`. Returns -1 if not found. |
+| `pci_get_bar` | Returns the Base Address Register `bar` (0–5) for the specified device, indicating the I/O or memory region assigned by the BIOS/firmware. |
+| `pci_enable_bus_mastering` | Sets bit 2 of the PCI command register for the device, required for DMA-capable devices such as network cards. |
+| `pci_get_interrupt_line` | Returns the IRQ line number encoded in the device's configuration space, as assigned by the firmware. |
+
+`pci_scan_bus()` is called unconditionally during early kernel initialization. All detected devices are reported via `serial_printf` so the boot log (visible in QEMU's stdio output) provides a complete picture of the virtual machine's hardware.
+
+## Real-Time Clock (RTC)
+
+The RTC driver reads the current date and time from the PC's CMOS memory. The CMOS is accessed by writing the desired register index to port 0x70 and reading the result from port 0x71. The driver handles BCD-to-binary conversion automatically, so all fields in `rtc_time_t` are plain binary integers.
+
+```c
+typedef struct {
+    uint16_t year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  second;
+} rtc_time_t;
+
+void rtc_init(void);
+void rtc_get_time(rtc_time_t *time);
+```
+
+| Function | Description |
+|---|---|
+| `rtc_init` | Verifies the RTC is not in an update cycle and logs initialization to serial. |
+| `rtc_get_time` | Waits until the CMOS update-in-progress flag clears, reads all six time registers, converts BCD to binary where necessary, and writes the result into the caller-supplied `rtc_time_t`. |
+
+The desktop taskbar calls `rtc_get_time` on every rendered frame and formats the result into the clock widget in the bottom-right corner. Because `rtc_get_time` spins waiting for the update-in-progress bit, it should not be called more often than once per frame (or approximately 60 times per second).
+
+```c
+rtc_time_t t;
+rtc_get_time(&t);
+kprintf("%d-%02d-%02d %02d:%02d:%02d\n",
+        t.year, t.month, t.day,
+        t.hour, t.minute, t.second);
+```

@@ -1,0 +1,158 @@
+---
+title: "SilverOS Window Manager: Create and Manage Windows"
+sidebarTitle: "Window Manager"
+description: "SilverOS includes a software window manager with Z-ordering, drag support, focus tracking, and draw/key/click callbacks. Full C API with usage examples."
+---
+
+SilverOS includes a lightweight software window manager built directly into the desktop shell. It supports up to 16 simultaneous windows, each with its own title bar, close button, drag mechanics, and per-window callbacks for drawing content, handling keyboard input, and responding to mouse clicks. The WM composites all windows into the framebuffer every frame, back-to-front, based on a Z-order array.
+
+## Window structure
+
+Every window is represented by a `window_t` struct. The WM maintains an internal array of 16 of these and exposes them via the public API:
+
+```c
+#define MAX_WINDOWS    16
+#define TITLEBAR_HEIGHT 24
+#define WINDOW_BORDER   2
+#define CLOSE_BTN_SIZE  16
+
+typedef struct {
+    int   x, y;                 /* screen position */
+    int   width, height;
+    char  title[64];
+    bool  visible;
+    bool  focused;
+    bool  dragging;
+    int   drag_offset_x, drag_offset_y;
+    uint32_t *content;          /* window content buffer (optional) */
+    int   content_w, content_h; /* content area dimensions */
+    void (*draw_content)(int window_id);        /* called every frame */
+    void (*handle_key)(int window_id, char key); /* keyboard input */
+    void (*handle_click)(int window_id, int mx, int my); /* mouse click in content area */
+    int   id;
+} window_t;
+```
+
+`content_w` and `content_h` are computed automatically by `window_create` as the inner drawable area:
+
+- `content_w = width - WINDOW_BORDER * 2`
+- `content_h = height - TITLEBAR_HEIGHT - WINDOW_BORDER`
+
+---
+
+## Window manager API
+
+```c
+/* Create a window. Returns window ID (0–15) or -1 on failure. */
+int window_create(const char *title, int x, int y, int w, int h);
+
+/* Destroy a window by ID. */
+void window_destroy(int id);
+
+/* Register callbacks */
+void window_set_draw_callback(int id, void (*draw)(int));
+void window_set_key_callback(int id, void (*handler)(int, char));
+void window_set_click_callback(int id, void (*handler)(int, int, int));
+
+/* Get a pointer to the window struct. Returns NULL if not found or not visible. */
+window_t *window_get(int id);
+```
+
+**`window_create`** — Scans the internal `windows[MAX_WINDOWS]` array for the first slot where `visible == false`, initialises it with the given position and size, pushes the new ID to the top of the Z-order array, and gives it focus. Returns the integer ID (0–15) on success, `-1` if all slots are occupied or no free slot is found.
+
+**`window_destroy`** — Marks the window as `visible = false`, removes it from the Z-order array, decrements the window count, and transfers focus to the next window at the top of the Z-order (if any).
+
+**`window_set_draw_callback`** — Registers a function that the WM calls every frame while compositing. Use this to draw the window's content area.
+
+**`window_set_key_callback`** — Registers a function invoked when a key is pressed and this window has focus. The `key` parameter is a `char` using the constants from `keyboard.h` (e.g. `KEY_ENTER`, `KEY_BACKSPACE`, `KEY_ESCAPE`).
+
+**`window_set_click_callback`** — Registers a function called when the user clicks inside the window's **content area** (below the title bar). Coordinates are screen-absolute.
+
+**`window_get`** — Returns a pointer to the internal `window_t` for read/write access, or `NULL` if the ID is out of range or the window is not visible.
+
+---
+
+## Z-ordering
+
+The WM maintains a `window_order[MAX_WINDOWS]` integer array alongside a counter `order_count`. This array stores window IDs ordered from **back** (index 0) to **front** (index `order_count - 1`).
+
+- **New windows** are appended to the end of `window_order`, placing them on top of all existing windows.
+- **Clicking a window** calls the internal `focus_window()`, which removes the window's ID from its current position in the array and re-appends it at the end — bringing it to the front.
+- **Rendering** iterates `window_order[0]` → `window_order[order_count - 1]`, drawing each window in back-to-front order so later windows always appear on top.
+- **Destroying a window** shifts all subsequent entries in `window_order` left by one and decrements `order_count`.
+
+---
+
+## Creating a custom window
+
+The pattern for all windows in SilverOS is: call `window_create`, then register your callbacks.
+
+```c
+/* Draw callback — called every frame */
+static void my_draw(int id) {
+    window_t *win = window_get(id);
+    if (!win) return;
+
+    int cx = win->x + WINDOW_BORDER;
+    int cy = win->y + TITLEBAR_HEIGHT + 2;
+    int cw = win->width  - WINDOW_BORDER * 2;
+    int ch = win->height - TITLEBAR_HEIGHT - WINDOW_BORDER - 2;
+
+    /* Fill content area */
+    fb_fill_rect(cx, cy, cw, ch, RGB(30, 30, 48));
+    font_draw_string(cx + 10, cy + 10, "Hello from my window!", COLOR_WHITE);
+}
+
+/* Key handler */
+static void my_key(int id, char key) {
+    if (key == KEY_ESCAPE) {
+        window_destroy(id);
+    }
+}
+
+/* Create and configure the window */
+int win_id = window_create("My Window", 200, 150, 400, 300);
+window_set_draw_callback(win_id, my_draw);
+window_set_key_callback(win_id, my_key);
+```
+
+The coordinates `cx`, `cy`, `cw`, `ch` define the inner content rectangle, accounting for the title bar height and window border. Always re-derive these from the current `win->x` / `win->y` inside your draw callback — the values change whenever the user drags the window.
+
+---
+
+## Click handling
+
+Click callbacks receive screen-absolute mouse coordinates. Convert them to content-relative coordinates for hit-testing UI elements inside the window:
+
+```c
+static void my_click(int id, int mx, int my_coord) {
+    /* mx, my_coord are screen coordinates */
+    window_t *win = window_get(id);
+    if (!win) return;
+    int local_x = mx - (win->x + WINDOW_BORDER);
+    int local_y = my_coord - (win->y + TITLEBAR_HEIGHT + 2);
+    /* use local_x, local_y for content-relative hit testing */
+}
+
+window_set_click_callback(win_id, my_click);
+```
+
+The click callback is only fired for clicks in the **content area** — below the title bar. Title bar clicks are consumed by the WM itself for drag initiation and focus. Close button clicks are also handled exclusively by the WM (see below).
+
+---
+
+## Close button
+
+Each window has a red close button (`RGB(180, 50, 50)`) drawn in the top-right corner of the title bar, sized `CLOSE_BTN_SIZE × CLOSE_BTN_SIZE` (16×16 pixels). The WM checks every left-click against the close button bounds before dispatching to any window callback.
+
+When the close button is clicked:
+
+1. The WM calls `window_destroy(win->id)` directly.
+2. Focus shifts to the new top-of-Z-order window, if any.
+3. **No callback is fired** — the window simply disappears. If you need cleanup on close (e.g. resetting a global ID), track the window ID in your module and detect the next call to `window_get` returning `NULL`.
+
+---
+
+<Note>
+The window manager supports a maximum of **`MAX_WINDOWS = 16`** windows at one time. `window_create` returns `-1` if all 16 slots are occupied. Slots are reused after `window_destroy` — the WM scans for the first entry where `visible == false` on each `window_create` call.
+</Note>

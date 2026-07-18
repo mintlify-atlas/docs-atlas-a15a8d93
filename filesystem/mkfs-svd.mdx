@@ -1,0 +1,129 @@
+---
+title: "mkfs_svd: Create a SilverFS Virtual Disk Image"
+sidebarTitle: "mkfs_svd"
+description: "mkfs_svd is a host-side C tool that formats a 16 MB .svd file with a valid SilverFS superblock, bitmaps, inode table, and empty root directory."
+---
+
+`mkfs_svd` is a host-side C utility that creates a fresh SilverFS-formatted virtual disk image (`.svd` file). It runs on the development machine — not inside the kernel — and must be executed before booting SilverOS whenever a new or clean disk is needed. The tool allocates a 16 MB flat binary image, writes a valid superblock, initialises the inode and block bitmaps, lays out an empty inode table, and sets up inode 0 as the root directory. The resulting file is passed directly to QEMU as a virtual ATA hard disk.
+
+<Note>
+  The kernel's `silverfs_format()` function is a stub that always returns `-1` with a warning message. All disk formatting must be performed with the host-side `mkfs_svd` tool. Never rely on the kernel to format the disk.
+</Note>
+
+## Building mkfs_svd
+
+`mkfs_svd` is built automatically as part of the standard build process. The compiled binary is placed at `build/mkfs_svd`.
+
+```bash
+make disk    # also builds the mkfs_svd binary at build/mkfs_svd
+# or directly:
+gcc -O2 -o build/mkfs_svd tools/mkfs_svd.c
+```
+
+The source lives at `tools/mkfs_svd.c` and has no dependencies beyond the C standard library, so it compiles cleanly on any Linux host.
+
+## Usage
+
+```bash
+build/mkfs_svd build/disk.svd
+# Output: Created SilverOS virtual disk: build/disk.svd (16 MB)
+```
+
+`mkfs_svd` takes exactly one argument: the path of the output `.svd` file to create. If the file already exists it is overwritten. On success, the tool prints a confirmation line and exits with status `0`; on failure (e.g., unable to open the output path or out of memory) it prints an error to stderr and exits with a non-zero status.
+
+## What mkfs_svd creates
+
+The tool `calloc`s a 16 MB buffer (`SVD_FILE_SIZE = 16 * 1024 * 1024`), populates it in memory, then writes the entire buffer to disk in a single `fwrite` call. The resulting image has the following structure:
+
+**Block 0 — Superblock**
+
+The `silverfs_superblock_t` at byte offset 0 is initialised with:
+
+| Field | Value |
+|---|---|
+| `magic` | `0x53494C56` ("SILV") |
+| `block_size` | `4096` |
+| `total_blocks` | `4096` |
+| `total_inodes` | `1024` |
+| `free_blocks` | `4096` minus structural blocks |
+| `free_inodes` | `1023` (inode 0 allocated to root) |
+| `inode_table_block` | `3` |
+| `data_block_start` | `22` |
+| `root_inode` | `0` |
+| `volume_name` | `"SilverOS"` |
+
+**Block 1 — Inode bitmap**
+
+A 4096-byte block where the first 128 bytes represent the 1024-inode bitmap. At creation time, only bit 0 is set (root inode). The remaining bits are zero.
+
+**Block 2 — Block bitmap**
+
+A 4096-byte block where the first 512 bytes represent the 4096-block bitmap. All structural blocks (0 through 21) are marked used at format time; block 22 (the root directory's data block) is also marked used. All higher blocks start free.
+
+**Blocks 3–21 — Inode table**
+
+Nineteen 4096-byte blocks holding the inode table (`1024 inodes × 76 bytes ≈ 19 blocks`). All entries are zeroed except inode 0, which describes the root directory:
+
+| Field | Value |
+|---|---|
+| `type` | `SILVERFS_TYPE_DIR` (`2`) |
+| `permissions` | `0755` |
+| `link_count` | `2` |
+| `size` | `0` |
+| `blocks[0]` | `22` (first data block) |
+| `block_count` | `1` |
+
+**Block 22 — Root directory data block**
+
+A single zeroed 4096-byte block allocated as the root directory's initial data block. It contains no directory entries at format time; `desktop_init()` populates it on first boot.
+
+## SVD file format
+
+A `.svd` file (SilverOS Virtual Disk) is a **flat raw binary image** with no header, partition table, or boot record beyond the SilverFS superblock. Every byte offset in the file corresponds directly to a byte on the virtual disk:
+
+- Byte offset `N × 4096` is the start of block `N`.
+- Block `N` maps to LBA `N × 8` (since each 4096-byte block spans 8 × 512-byte ATA sectors).
+
+The kernel accesses the disk via the ATA PIO driver (`ata_read_sectors` / `ata_write_sectors` in `include/ata.h`) using the macro `BLOCK_TO_LBA(block) = block * (SILVERFS_BLOCK_SIZE / ATA_SECTOR_SIZE)`.
+
+The file is passed to QEMU as the first virtual ATA hard disk:
+
+```bash
+qemu-system-x86_64 ... -hda build/disk.svd
+```
+
+## Default filesystem structure at first boot
+
+When SilverOS boots for the first time against a freshly formatted disk, `desktop_init()` (in `desktop/desktop.c`) creates a set of standard directories and seed files using the SilverFS kernel API:
+
+| Path | Type | Contents |
+|---|---|---|
+| `/home/` | Directory | — |
+| `/home/user/` | Directory | — |
+| `/etc/` | Directory | — |
+| `/tmp/` | Directory | — |
+| `/etc/hostname` | File | `silveros` |
+| `/home/user/readme.txt` | File | Welcome message |
+
+The welcome message written to `/home/user/readme.txt` is:
+
+```
+Welcome to SilverOS!
+This is your home directory.
+Type 'help' in the terminal for commands.
+```
+
+Because SilverFS is persistent, these files are created only once. On every subsequent boot the kernel mounts the existing disk and finds them already present.
+
+## Regenerating the disk
+
+Running `make disk` or `make` rebuilds `build/disk.svd` from scratch using `mkfs_svd`. This produces a clean, empty filesystem with only the structural metadata written — none of the files created by `desktop_init()` or any user session are preserved.
+
+```bash
+make disk   # regenerates a fresh disk.svd
+make        # builds kernel + disk (also regenerates disk.svd)
+```
+
+<Warning>
+  Regenerating `disk.svd` permanently destroys all files written to the SilverFS during previous runs, including any files created by `desktop_init()` or stored during user sessions. There is no recovery mechanism. If you want to preserve disk contents across builds, avoid running `make disk` or `make` after initial setup, and back up `build/disk.svd` manually.
+</Warning>

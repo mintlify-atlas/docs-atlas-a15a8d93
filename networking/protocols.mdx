@@ -1,0 +1,161 @@
+---
+title: "ARP, IPv4, and ICMP Protocol Implementation in SilverOS"
+sidebarTitle: "Protocols"
+description: "Deep dive into SilverOS ARP cache and resolution, IPv4 packet send and receive, and ICMP echo request and reply handling with full C API reference."
+---
+
+SilverOS implements three network protocols — ARP, IPv4, and ICMP — as thin, self-contained C modules that sit above the RTL8139 Ethernet driver. Each module handles one layer of the stack: ARP maps IP addresses to MAC addresses, IPv4 routes packets to the right protocol handler or builds outbound datagrams, and ICMP processes incoming ping requests and drives outbound echo requests from the kernel terminal. This page documents every public function, the shared type system, and the precise data flow through all three layers.
+
+## Type definitions
+
+All protocol structures and address types are defined in `include/net.h` with `__attribute__((packed))` to guarantee no compiler-inserted padding. The byte layout of each struct maps exactly onto the wire format.
+
+```c
+typedef uint8_t mac_addr_t[6];
+typedef uint8_t ip_addr_t[4];
+
+/* Ethernet II Header (14 bytes) */
+typedef struct __attribute__((packed)) {
+    mac_addr_t dest;
+    mac_addr_t src;
+    uint16_t   type;
+} ethernet_header_t;
+
+/* ARP Packet (28 bytes) */
+typedef struct __attribute__((packed)) {
+    uint16_t hw_type;      /* 1 = Ethernet */
+    uint16_t proto_type;   /* 0x0800 = IPv4 */
+    uint8_t  hw_len;       /* 6 */
+    uint8_t  proto_len;    /* 4 */
+    uint16_t op;           /* 1 = request, 2 = reply */
+    mac_addr_t sender_mac;
+    ip_addr_t  sender_ip;
+    mac_addr_t target_mac;
+    ip_addr_t  target_ip;
+} arp_packet_t;
+
+/* IPv4 Header (20 bytes) */
+typedef struct __attribute__((packed)) {
+    uint8_t  ihl     : 4;
+    uint8_t  version : 4;
+    uint8_t  tos;
+    uint16_t total_length;
+    uint16_t identification;
+    uint16_t flags_fragment;
+    uint8_t  ttl;       /* default 64 */
+    uint8_t  proto;     /* 1 = ICMP */
+    uint16_t checksum;
+    ip_addr_t src_ip;
+    ip_addr_t dest_ip;
+} ipv4_header_t;
+
+/* ICMP Header (8 bytes) */
+typedef struct __attribute__((packed)) {
+    uint8_t  type;       /* 8 = echo request, 0 = echo reply */
+    uint8_t  code;
+    uint16_t checksum;
+    uint16_t identifier;
+    uint16_t sequence;
+} icmp_header_t;
+```
+
+`mac_addr_t` and `ip_addr_t` are simple byte arrays. All multi-byte fields in the structs are stored in network byte order (big-endian) and must be converted with `htons`/`ntohs` or `htonl`/`ntohl` before use — see the [Endianness helpers](/networking/overview#endianness-helpers) section of the overview.
+
+## ARP
+
+Address Resolution Protocol translates an IPv4 address into the MAC address needed to construct an Ethernet frame. SilverOS implements a flat, statically-sized ARP cache in `net/arp.c`.
+
+**Cache.** The cache holds 16 entries, each storing a validated `(ip_addr_t, mac_addr_t)` pair and an integer `valid` flag. `arp_init` zeroes all `valid` flags; it is called by `net_init` during boot.
+
+**Receiving ARP packets.** `arp_handle_packet` is invoked by `net_receive_packet` for every frame with EtherType `0x0806`. It first validates that the hardware type is `1` (Ethernet) and the protocol type is `0x0800` (IPv4), then unconditionally caches the sender's IP-to-MAC mapping by scanning for an existing entry with that IP or the first free slot. If the packet is an ARP request (`op == 1`) addressed to `net_my_ip`, the function immediately builds a 28-byte ARP reply, swaps the sender and target fields, fills `sender_mac` with `rtl8139_mac`, and delivers it via `ethernet_send`.
+
+**Resolving a MAC address.** `arp_resolve` scans all 16 cache entries for a valid match. On a hit it copies the cached MAC into `*out_mac` and returns `1`. On a miss it calls `arp_request` to broadcast a 28-byte ARP request to `net_bcast_mac`, then returns `0` — the caller is responsible for retrying after the reply arrives and populates the cache.
+
+```c
+void arp_init(void);
+void arp_handle_packet(void *data, uint16_t len);
+void arp_request(ip_addr_t ip);
+int  arp_resolve(ip_addr_t ip, mac_addr_t *out_mac);  /* 1 = found, 0 = not found (request sent) */
+```
+
+<Note>
+  The ARP cache is an in-memory array and is not persisted across reboots. After a hard reset, every IP-to-MAC mapping is lost. The first attempt to send a packet to a previously known address will trigger a new ARP request, and the initial outbound packet will be dropped while the exchange completes. A second attempt after the reply arrives will succeed.
+</Note>
+
+## IPv4
+
+SilverOS's IPv4 implementation in `net/ipv4.c` handles both the inbound path (demultiplexing received datagrams to the correct protocol handler) and the outbound path (building a standard 20-byte header and resolving the destination MAC before handing the frame to Ethernet).
+
+**Receiving IPv4 packets.** `ipv4_handle_packet` is called by `net_receive_packet` for frames with EtherType `0x0800`. It checks that the IP version field is `4`, computes the header length from `ihl * 4`, and silently drops any packet not addressed to `net_my_ip`. For packets that pass the destination check, it calculates the payload pointer and length from `total_length`, then dispatches on `proto`:
+
+- `proto == 1` → `icmp_handle_packet(ip_hdr, payload, payload_len)`
+
+All other protocol numbers are currently silently ignored.
+
+**Sending IPv4 packets.** `ipv4_send` constructs a 20-byte IPv4 header in a local `1536`-byte buffer:
+
+- `version = 4`, `ihl = 5` (no options), `tos = 0`
+- `total_length` = `sizeof(ipv4_header_t) + payload_len`, converted to network byte order
+- `identification` = auto-incrementing 16-bit counter `ip_id++`, in network byte order
+- `flags_fragment = 0` (no fragmentation)
+- `ttl = 64`
+- `proto` = caller-supplied protocol number
+- `checksum` = computed by `net_checksum` over the 20-byte header (checksum field zeroed first)
+- `src_ip` = `net_my_ip`, `dest_ip` = caller-supplied destination
+
+After building the header, `ipv4_send` calls `arp_resolve`. On success, the complete packet is passed to `ethernet_send` with EtherType `0x0800`. On failure (ARP miss), the packet is dropped and a message is written to serial output:
+
+```
+[IPv4] Dropping packet to 10.0.2.2, waiting for ARP resolution
+```
+
+```c
+void ipv4_handle_packet(void *data, uint16_t len);
+void ipv4_send(ip_addr_t dest, uint8_t proto,
+               void *payload, uint16_t payload_len);
+```
+
+## ICMP
+
+ICMP in SilverOS (`net/icmp.c`) provides two capabilities: responding to incoming Echo Requests (ping replies) and generating outbound Echo Requests from the kernel terminal (`ping` command).
+
+**Handling incoming ICMP.** `icmp_handle_packet` is called by `ipv4_handle_packet` with the already-parsed `ipv4_header_t` pointer (needed for the source IP), the ICMP payload, and its byte length. It dispatches on `icmp->type`:
+
+- **Type 8 — Echo Request:** logs the sender's IP to serial, then constructs an Echo Reply in a local buffer. The reply header sets `type = 0` and `code = 0`, copies `identifier` and `sequence` verbatim from the request, zeroes the checksum field, copies the request's payload bytes after the header, and computes the checksum over the entire ICMP message. The reply is sent via `ipv4_send` back to `ip_hdr->src_ip`.
+
+- **Type 0 — Echo Reply:** logs the sender's IP and `ntohs(icmp->sequence)` to serial output. No further action is taken.
+
+**Sending an Echo Request.** `icmp_send_echo_request` builds a 40-byte ICMP packet: an 8-byte header followed by 32 bytes of dummy ASCII payload (`'A'` through `'Z'` repeating). The identifier is always `0x1234`; the sequence number is drawn from a static `ping_seq` counter that increments with each call. The checksum is computed over the full 40 bytes before the packet is handed to `ipv4_send`.
+
+```c
+void icmp_handle_packet(ipv4_header_t *ip_hdr, void *data, uint16_t len);
+void icmp_send_echo_request(ip_addr_t ip);
+```
+
+From the SilverOS terminal, issuing a `ping` command calls `icmp_send_echo_request` and prints a confirmation:
+
+```bash
+$ ping 10.0.2.2
+Ping request sent (check serial for replies)
+```
+
+The corresponding serial output, visible via `make run` with `-serial stdio`, looks like:
+
+```
+[ICMP] Pinging 10.0.2.2...
+[ICMP] Ping reply received from 10.0.2.2 (seq=1)
+```
+
+## Packet flow example
+
+The following traces a complete outbound ping from the moment the terminal command is issued to the moment the raw frame exits the NIC:
+
+1. **Terminal** calls `icmp_send_echo_request({10, 0, 2, 2})`.
+2. **ICMP** (`net/icmp.c`) builds a 40-byte packet: 8-byte `icmp_header_t` (`type=8`, `id=0x1234`, `seq=ping_seq++`) plus 32 bytes of `'A'`–`'Z'` payload. `net_checksum` is run over all 40 bytes and stored in `icmp->checksum`.
+3. **ICMP** calls `ipv4_send({10, 0, 2, 2}, 1, packet, 40)`.
+4. **IPv4** (`net/ipv4.c`) prepends a 20-byte `ipv4_header_t` (`version=4`, `ihl=5`, `ttl=64`, `proto=1`, `src=10.0.2.15`, `dest=10.0.2.2`), computes the IPv4 header checksum via `net_checksum`.
+5. **IPv4** calls `arp_resolve({10, 0, 2, 2}, &dest_mac)`:
+   - **Cache hit** → proceeds immediately.
+   - **Cache miss** → `arp_request` broadcasts an ARP request; IPv4 logs a drop message to serial and returns. The caller must retry after the ARP reply is received.
+6. **Ethernet** (`net/ethernet.c`) prepends a 14-byte `ethernet_header_t` (`dest=dest_mac`, `src=rtl8139_mac`, `type=0x0800` in network byte order) to produce a 74-byte frame.
+7. **RTL8139** (`drivers/rtl8139.c`) copies the frame into one of four 1536-byte transmit buffers, writes the buffer address to the appropriate `TSAD` register, and writes the length to the `TSD` register to trigger DMA transmission.

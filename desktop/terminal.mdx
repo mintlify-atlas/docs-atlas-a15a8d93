@@ -1,0 +1,135 @@
+---
+title: "SilverOS Built-In Terminal: Shell Commands and Usage"
+sidebarTitle: "Terminal"
+description: "The SilverOS desktop includes a resizable terminal window with a command interpreter supporting ls, cat, mkdir, touch, write, ping, free, date, and more."
+---
+
+SilverOS ships a graphical terminal emulator built directly into the desktop shell. It opens as a standard window (640×440 pixels) and provides a command interpreter that can interact with the SilverFS filesystem, query hardware state from the RTC and physical memory manager, and send ICMP packets over the network. The terminal is the primary way to interact with the OS after login.
+
+## Opening the terminal
+
+The terminal can be opened in two ways:
+
+1. **Automatically on login** — after `user_login()` succeeds, `desktop_init` calls `terminal_open()` immediately so the terminal is ready the moment the desktop appears.
+2. **From the start menu** — click the **Silver** button in the taskbar, then select **Terminal**.
+
+```c
+void terminal_open(void);
+```
+
+`terminal_open()` checks whether a terminal window already exists (by testing `term_window_id` against `window_get()`). If it does, the existing window is focused rather than a second instance being created. If no terminal is open, a fresh window is created, the scroll buffer is cleared, and the ASCII art banner is printed.
+
+<Tip>
+After logging in, open the terminal and run `cat /home/user/readme.txt` as your first command to read the welcome message that `desktop_init()` wrote at boot.
+</Tip>
+
+---
+
+## Available commands
+
+The function `term_process_command` dispatches on the command string using `strcmp` / `strncmp`. All commands are case-sensitive and lowercase.
+
+| Command | Usage | Description |
+|---|---|---|
+| `help` | `help` | Lists all available commands |
+| `clear` | `clear` | Clears the terminal screen |
+| `ls` | `ls [dir]` | Lists directory contents with type and size |
+| `cat` | `cat /path/to/file` | Prints file contents |
+| `echo` | `echo some text` | Prints text to terminal |
+| `mkdir` | `mkdir /path/to/dir` | Creates a directory |
+| `touch` | `touch /path/to/file` | Creates an empty file |
+| `write` | `write /path/to/file data` | Writes text to a file |
+| `uname` | `uname` | Prints `SilverOS v0.1.0 x86_64` |
+| `free` | `free` | Shows free physical pages and MB |
+| `date` | `date` | Shows hardware date/time from RTC |
+| `ifconfig` | `ifconfig` | Shows MAC and IP address of eth0 |
+| `ping` | `ping 10.0.2.2` | Sends ICMP echo request |
+| `reboot` | `reboot` | Reboots via keyboard controller (`0x64 = 0xFE`) — only in shell mode |
+
+If an unknown string is entered, the terminal prints `Unknown command: <input>`.
+
+---
+
+## Usage examples
+
+```text
+$ ls /
+  [DIR]  home
+  [DIR]  etc
+  [DIR]  tmp
+
+$ cat /etc/hostname
+silveros
+
+$ touch /tmp/test.txt
+File created
+
+$ write /tmp/test.txt Hello world
+Written successfully
+
+$ cat /tmp/test.txt
+Hello world
+
+$ free
+Free pages: 48221 (188 MB)
+
+$ date
+2024-01-15 10:30:42
+
+$ ifconfig
+eth0: MAC 52:54:00:12:34:56
+      IP  10.0.2.15
+
+$ ping 10.0.2.2
+Ping request sent (check serial for replies)
+```
+
+---
+
+## Terminal internals
+
+The terminal is implemented entirely inside `desktop/desktop.c`. Its state is held in a set of static variables:
+
+| Variable | Type / Size | Purpose |
+|---|---|---|
+| `term_lines` | `char[256][81]` | 256-line scroll buffer, each line up to 80 chars |
+| `term_line_count` | `int` | Number of lines currently in the buffer |
+| `term_input` | `char[256]` | Current input line being typed |
+| `term_input_len` | `int` | Length of `term_input` |
+| `term_window_id` | `int` | WM window ID of the terminal (`-1` if closed) |
+
+**Rendering** — `term_draw` is registered as the window's draw callback and is called every frame:
+
+1. The content area is filled with `RGB(15, 15, 25)` (near-black).
+2. `visible_lines = content_height / FONT_HEIGHT` determines how many lines fit. The font is **8×16 pixels** (`FONT_HEIGHT = 16`).
+3. Lines are rendered from `term_lines[start]` to `term_lines[term_line_count - 1]`, where `start` is adjusted so the most recent lines always fill the bottom of the window.
+4. The prompt `$ ` is drawn in green (`RGB(100, 200, 120)`); the input text is in light grey (`RGB(210, 215, 225)`).
+5. A **blinking cursor** is drawn at the end of the input text using `(timer_get_ticks() / 500) % 2` to toggle visibility at roughly 1 Hz.
+
+**Scroll buffer overflow** — when `term_line_count` reaches 256, `term_add_line` shifts all lines up by one and writes the new line at index 255, effectively discarding the oldest line.
+
+**Input handling** — `term_key_handler` is the registered key callback. Printable ASCII characters (`0x20`–`0x7E`) are appended to `term_input`. `KEY_BACKSPACE` (0x08) or `0x7F` removes the last character. `KEY_ENTER` (0x0A) echoes `$ <input>` to the scroll buffer, passes the input to `term_process_command`, then clears the input buffer.
+
+---
+
+## File Browser
+
+The desktop also ships a graphical file browser, accessible from the start menu:
+
+```c
+void file_browser_open(const char *path);
+```
+
+Calling `file_browser_open("/")` opens a 500×350-pixel window showing the contents of the given path. Like `terminal_open()`, if a file browser window is already open it navigates to the new path instead of creating a duplicate.
+
+Inside the browser:
+
+- **Directories** are shown with a yellow-gold icon and name; **files** show a white icon, name, and byte size on the right.
+- **Single-click** selects an entry (highlighted in blue).
+- **Double-click** (simulated by clicking an already-selected entry) navigates into a directory.
+- The **Back** button in the toolbar strips the last path component and navigates up. At the root (`/`), the Back button is a no-op.
+- The window title updates dynamically to reflect the current path: `File Browser - /home/user`.
+
+<Note>
+The `ping` command only **sends** the ICMP echo request via `icmp_send_echo_request()`. ICMP replies are logged to the serial port, not to the graphical terminal. Run QEMU with `-serial stdio` to see reply output in the host terminal.
+</Note>

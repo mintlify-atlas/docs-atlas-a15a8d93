@@ -1,0 +1,149 @@
+---
+title: "PS/2 Keyboard and Mouse Drivers in SilverOS"
+sidebarTitle: "Input"
+description: "SilverOS reads PS/2 keyboard and mouse input via IRQ-driven ring buffers. Documents the keyboard API, special key codes, and mouse state struct."
+---
+
+SilverOS handles all human input through the legacy PS/2 controller (Intel 8042). The keyboard driver is wired to IRQ1 and the mouse driver to IRQ12; both use interrupt-driven ring buffers so the kernel never needs to poll the hardware in a spin loop. Scancodes are translated to ASCII or to named special-key constants at interrupt time, and the results are deposited into a 256-byte ring buffer for the main loop to consume at its own pace.
+
+## Keyboard driver
+
+The keyboard interrupt handler (`IRQ1`) reads a raw scancode from I/O port `0x60` on every keypress or key-release event. Make-codes (key presses) are mapped to ASCII characters using the US QWERTY Scancode Set 1 translation tables built into the driver. Break-codes (key releases, scancode | 0x80) are used only to track the state of modifier keys — they are never placed in the ring buffer.
+
+Three modifier states are tracked globally:
+
+- **Shift** — either left shift (0x2A) or right shift (0x36) sets `shift_held`; the corresponding break-code clears it.
+- **Ctrl** — left control (0x1D) sets `ctrl_held`; its break-code clears it.
+- **Caps Lock** — scancode 0x3A toggles `caps_lock`; the driver XORs this with `shift_held` to determine case for letter keys.
+
+The full keyboard API is declared in `keyboard.h`:
+
+```c
+#define KEY_BUFFER_SIZE 256
+
+/* Special key codes */
+#define KEY_ESCAPE    0x1B
+#define KEY_BACKSPACE 0x08
+#define KEY_TAB       0x09
+#define KEY_ENTER     0x0A
+#define KEY_LSHIFT    0x80
+#define KEY_RSHIFT    0x81
+#define KEY_LCTRL     0x82
+#define KEY_LALT      0x83
+#define KEY_CAPSLOCK  0x84
+#define KEY_F1        0x85
+#define KEY_F2        0x86
+#define KEY_F3        0x87
+#define KEY_F4        0x88
+#define KEY_UP        0x90
+#define KEY_DOWN      0x91
+#define KEY_LEFT      0x92
+#define KEY_RIGHT     0x93
+#define KEY_HOME      0x94
+#define KEY_END       0x95
+#define KEY_PAGEUP    0x96
+#define KEY_PAGEDOWN  0x97
+#define KEY_DELETE    0x98
+
+void keyboard_init(void);
+char keyboard_getchar(void);        /* blocking — waits for keypress */
+int  keyboard_haschar(void);        /* non-blocking poll */
+char keyboard_getchar_nb(void);     /* non-blocking, returns 0 if empty */
+bool keyboard_shift_pressed(void);
+bool keyboard_ctrl_pressed(void);
+```
+
+| Function | Description |
+|---|---|
+| `keyboard_init` | Registers the IRQ1 handler in the IDT and unmasks IRQ1 in the PIC. Logs `[KEYBOARD] PS/2 keyboard initialized` to the serial port. |
+| `keyboard_getchar` | Blocks until a character is available in the ring buffer, then dequeues and returns it. |
+| `keyboard_haschar` | Returns non-zero if at least one character is waiting in the buffer. Safe to call from the main event loop. |
+| `keyboard_getchar_nb` | Dequeues and returns the next character, or `0` if the buffer is empty. Intended for non-blocking polling. |
+| `keyboard_shift_pressed` | Returns the current state of either Shift key. |
+| `keyboard_ctrl_pressed` | Returns the current state of the left Ctrl key. |
+
+## Reading keyboard input
+
+For contexts that can afford to block — such as a text prompt before the desktop starts — use `keyboard_getchar()` directly:
+
+```c
+/* Blocking read (halts CPU until key available) */
+char c = keyboard_getchar();
+```
+
+Inside the desktop event loop, where the frame must keep rendering, use the non-blocking form instead:
+
+```c
+/* Non-blocking poll in a main loop */
+if (keyboard_haschar()) {
+    char c = keyboard_getchar_nb();
+    if (c == KEY_ENTER) { /* handle enter */ }
+    else if (c == KEY_UP) { /* handle up arrow */ }
+}
+```
+
+Modifier queries can be combined with the character read. For example, to detect Ctrl+C:
+
+```c
+if (keyboard_haschar()) {
+    char c = keyboard_getchar_nb();
+    if (c == 'c' && keyboard_ctrl_pressed()) {
+        /* handle Ctrl+C */
+    }
+}
+```
+
+<Note>
+  `keyboard_getchar` blocks by executing `hlt` inside a spin loop — the CPU is halted and resumes only when the next interrupt fires. This is appropriate for single-purpose blocking prompts, but must never be called from inside the desktop rendering loop, as it will stall all drawing and mouse handling until a key is pressed. Use `keyboard_getchar_nb` in any context that has a frame loop.
+</Note>
+
+## Mouse driver
+
+The PS/2 mouse is enabled through the 8042 controller and fires IRQ12. The driver accumulates the three-byte mouse packet, updates an internal `mouse_state_t` struct, and clamps the cursor position to the screen bounds derived from `fb.width` and `fb.height`.
+
+```c
+typedef struct {
+    int  x;
+    int  y;
+    bool left_button;
+    bool right_button;
+    bool middle_button;
+    bool left_clicked;   /* one-shot flag: set on press, cleared by mouse_clear_clicks() */
+    bool left_released;  /* one-shot flag: set on release, cleared by mouse_clear_clicks() */
+} mouse_state_t;
+
+void mouse_init(void);
+void mouse_get_state(mouse_state_t *state);
+void mouse_clear_clicks(void);
+```
+
+| Function | Description |
+|---|---|
+| `mouse_init` | Enables the PS/2 auxiliary device via the 8042 command port, sets mouse resolution and sample rate, registers the IRQ12 handler, and unmasks IRQ12 in the PIC. |
+| `mouse_get_state` | Copies the current internal mouse state into the caller-supplied `mouse_state_t`. This is a non-blocking snapshot — safe to call every frame. |
+| `mouse_clear_clicks` | Clears the `left_clicked` and `left_released` one-shot flags. Must be called after handling a click event to prevent it from being processed on every subsequent frame. |
+
+The distinction between `left_button` and `left_clicked` is important:
+
+- `left_button` is `true` for as long as the button is physically held down. Use this for drag operations.
+- `left_clicked` is `true` only for frames after the button was first pressed, until `mouse_clear_clicks()` is called. Use this for single-action click events like button presses and icon activations.
+
+Cursor coordinates are clamped to `[0, fb.width]` × `[0, fb.height]` by the IRQ12 handler, so `ms.x` and `ms.y` are always valid pixel positions regardless of how fast the mouse is moved.
+
+## Mouse usage in the desktop event loop
+
+```c
+mouse_state_t ms;
+mouse_get_state(&ms);
+
+if (ms.left_clicked) {
+    mouse_clear_clicks();
+    /* handle click at (ms.x, ms.y) */
+}
+
+if (ms.left_button) {
+    /* button is held — handle drag */
+}
+```
+
+A typical desktop frame reads mouse state once at the top of the loop, performs hit-testing against UI elements, and then renders the cursor sprite on top of the composed scene before calling `fb_swap_buffers()`. Because `mouse_get_state` copies the state atomically, the cursor position seen during rendering is consistent throughout the frame even if the IRQ12 handler fires mid-frame.

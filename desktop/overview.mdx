@@ -1,0 +1,158 @@
+---
+title: "SilverOS Desktop Environment: GUI Shell and Login"
+sidebarTitle: "Overview"
+description: "SilverOS features a graphical desktop with a gradient background, taskbar, start menu, Z-ordering window manager, and a login screen backed by the user system."
+---
+
+SilverOS ships a fully graphical desktop environment that runs directly on bare metal with no OS beneath it. After the kernel initialises hardware, the system transitions into a pixel-rendered shell with a gradient background, a taskbar, a start menu, draggable windows, and a login screen. Every visual element — from the deep indigo background to the blinking terminal cursor — is drawn by the kernel itself through the framebuffer driver.
+
+## Desktop components
+
+<CardGroup cols={2}>
+  <Card title="Window Manager" icon="window" href="/desktop/window-manager">
+    Z-ordered, draggable windows with per-window draw, key, and click callbacks. Supports up to 16 simultaneous windows.
+  </Card>
+  <Card title="Terminal" icon="terminal" href="/desktop/terminal">
+    Built-in command interpreter with filesystem, network, memory, and system commands.
+  </Card>
+</CardGroup>
+
+Beyond windows, the desktop includes these always-visible components:
+
+- **Taskbar** — A 32-pixel bar anchored to the bottom of the screen. It holds the "Silver" menu button, one clickable button per open window, and a live clock.
+- **Start menu** — A pop-up panel launched from the "Silver" button. Lists five entries: File Browser, Terminal, About, a separator, and Shutdown.
+- **Login screen** — A centered window shown at boot. Accepts a username and password, validated by the user subsystem before the desktop becomes interactive.
+- **Desktop background** — A full-screen vertical gradient drawn every frame behind all windows.
+
+---
+
+## Boot-to-desktop flow
+
+<Steps>
+  <Step title="Boot menu in kernel_main">
+    The kernel presents a text-mode boot menu. The user selects **Start SilverOS Desktop** to continue.
+  </Step>
+  <Step title="Boot animation">
+    `bootanim_play()` runs a short graphical animation to signal that the system is starting.
+  </Step>
+  <Step title="desktop_init()">
+    `desktop_init()` zeroes the window manager state, sets up the default filesystem structure under SilverFS, and creates the login window centered on screen.
+  </Step>
+  <Step title="Login screen">
+    The graphical login window presents **Username** and **Password** fields. The user types credentials (Tab switches fields, Enter submits). The kernel calls `user_login()` to validate.
+  </Step>
+  <Step title="Session start">
+    On a successful login the login window is destroyed, `terminal_open()` is called automatically to launch the terminal, and execution falls into `desktop_run()` — the infinite event loop that drives all desktop activity.
+  </Step>
+</Steps>
+
+---
+
+## Desktop visual design
+
+All colours are defined as 32-bit `RGB(r, g, b)` values at the top of `desktop/desktop.c`. The full theme:
+
+| Element | Color | Value |
+|---|---|---|
+| Background top | Deep indigo | `RGB(25, 25, 50)` |
+| Background bottom | Indigo-navy | `RGB(40, 45, 65)` |
+| Taskbar | Very dark blue-black | `RGB(20, 20, 35)` |
+| Taskbar top border | Muted blue-grey | `RGB(60, 65, 80)` |
+| Window titlebar (unfocused) | Dark slate | `RGB(45, 45, 70)` |
+| Window titlebar (focused) | Brighter slate-blue | `RGB(70, 75, 110)` |
+| Titlebar text | Cool off-white | `RGB(210, 215, 225)` |
+| Window body | Very dark blue | `RGB(30, 30, 48)` |
+| Close button | Deep red | `RGB(180, 50, 50)` |
+| Close button (hover) | Brighter red | `RGB(220, 70, 70)` |
+| "Silver" menu button | Muted indigo | `RGB(55, 60, 85)` |
+| Clock text | Muted blue-grey | `RGB(170, 175, 190)` |
+| Watermark | Dim dark blue | `RGB(50, 55, 70)` |
+
+The background gradient is drawn each frame with `fb_draw_gradient_v()`. Window titlebars also receive a subtle top-edge highlight by blending each pixel row with white at decreasing alpha over the upper half of the titlebar. The text **"SilverOS v0.1"** is rendered as a watermark in the bottom-right of the desktop area (above the taskbar).
+
+---
+
+## Login system
+
+The user subsystem is declared in `include/user.h`:
+
+```c
+#define MAX_USERS     16
+#define MAX_USERNAME  32
+
+typedef struct {
+    int uid;
+    char username[MAX_USERNAME];
+    char password_hash[64]; /* plaintext for demo */
+} user_t;
+
+void        user_init(void);
+bool        user_login(const char *username, const char *password);
+int         user_get_current_uid(void);
+const char *user_get_current_username(void);
+bool        user_create(const char *username, const char *password);
+```
+
+`user_init()` is called during kernel startup and seeds a default user account. `user_login(username, password)` checks the supplied credentials and, on success, records the current UID so that `user_get_current_uid()` and `user_get_current_username()` return the correct values for the session.
+
+The graphical login window behaves as follows:
+
+- **Tab** switches focus between the Username and Password input fields; the focused field is drawn with a slightly lighter background.
+- **Enter** (or clicking the "Login" button) submits the credentials to `user_login()`.
+- On a **wrong password**, the password field is cleared and the user can try again without restarting.
+- The password field renders each character as `*` so the plaintext is never visible on screen.
+
+---
+
+## Default filesystem at first boot
+
+`desktop_init()` creates a minimal directory tree in SilverFS before showing the login screen:
+
+| Path | Type | Contents |
+|---|---|---|
+| `/home/` | Directory | — |
+| `/home/user/` | Directory | — |
+| `/etc/` | Directory | — |
+| `/tmp/` | Directory | — |
+| `/etc/hostname` | File | `silveros` |
+| `/home/user/readme.txt` | File | Welcome message with `help` tip |
+
+The welcome message written to `/home/user/readme.txt` is:
+
+```text
+Welcome to SilverOS!
+This is your home directory.
+Type 'help' in the terminal for commands.
+```
+
+---
+
+## Taskbar
+
+The taskbar is drawn at the bottom of the screen as a 32-pixel-tall strip (`TASKBAR_HEIGHT = 32`). It contains three zones rendered left to right:
+
+1. **"Silver" menu button** — A labelled button at x=4. Clicking it toggles `menu_open`, which shows or hides the start menu pop-up above the taskbar.
+2. **Window buttons** — One 120-pixel-wide button per open window, starting at x=100 with a 6-pixel gap between buttons. The button for the currently focused window is drawn in `TITLEBAR_FOCUSED` (`RGB(70, 75, 110)`); all others use `MENU_BTN_BG` (`RGB(55, 60, 85)`). Clicking any button calls `focus_window()` for that window.
+3. **Clock** — Positioned at the far right (`fb.width - 60`). Reads the current time from the RTC via `rtc_get_time()` on every frame and displays it as **HH:MM**.
+
+---
+
+## Start menu
+
+The start menu is a 160×126-pixel panel that appears just above the "Silver" button when `menu_open` is true. It contains five entries:
+
+| # | Label | Action |
+|---|---|---|
+| 0 | File Browser | Calls `file_browser_open("/")` |
+| 1 | Terminal | Calls `terminal_open()` |
+| 2 | About | Opens an "About SilverOS" window |
+| — | *(separator)* | Horizontal rule drawn across the menu |
+| 4 | Shutdown | Writes `0x2000` to I/O port `0x604` (ACPI power-off in QEMU) |
+
+Clicking anywhere outside the menu area closes it without taking any action.
+
+---
+
+<Note>
+`desktop_run()` never returns. It is an infinite `while (1)` loop that continuously redraws the framebuffer, processes mouse and keyboard events, and advances window state with a ~16 ms sleep between frames (`sleep_ms(16)`). SilverOS has no scheduler or process model — the desktop loop **is** the running system after boot.
+</Note>

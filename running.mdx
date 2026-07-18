@@ -1,0 +1,138 @@
+---
+title: "Run SilverOS in QEMU with Networking and Storage"
+sidebarTitle: "Running"
+description: "Launch SilverOS in QEMU using make run, navigate the boot menu, log in to the desktop, and use the built-in terminal to explore the filesystem."
+---
+
+The fastest way to run SilverOS is inside QEMU, which requires no physical hardware and gives you a serial debug console in the same terminal window. A single `make run` command builds the bootable ISO, formats the SilverFS disk image if it does not exist, and launches the emulator with the correct flags for networking, storage, and graphics. The full graphical desktop appears in a QEMU window at 1024×768 within seconds of boot.
+
+<Tip>
+  `make run` automatically tries to start QEMU with `-enable-kvm` first. If KVM is not available on your machine (e.g. inside a VM or on a host without virtualization extensions), it silently falls back to software emulation. You never need to pick — but if you always want software emulation, use `make run-nokvm` instead.
+</Tip>
+
+## QEMU command
+
+`make run` ultimately invokes the following command (or the same command without `-enable-kvm` if KVM is unavailable):
+
+```bash
+qemu-system-x86_64 \
+    -cdrom build/silveros.iso \
+    -hda build/disk.svd \
+    -m 256M \
+    -serial stdio \
+    -vga std \
+    -nic user,model=rtl8139 \
+    -enable-kvm
+```
+
+| Flag | Description |
+|------|-------------|
+| `-cdrom build/silveros.iso` | Attaches the bootable GRUB2 ISO as the CD-ROM drive. QEMU's firmware boots from it automatically |
+| `-hda build/disk.svd` | Attaches the SilverFS virtual disk image as the primary hard drive (`/dev/hda`). The kernel mounts this as the root filesystem via `silverfs_mount()` |
+| `-m 256M` | Allocates 256 MB of RAM to the VM, matching the kernel's expected memory layout (heap starts at 16 MB, 4 MB in size) |
+| `-serial stdio` | Redirects the VM's serial port (COM1) to your host terminal's stdin/stdout. All kernel `serial_printf` output appears here in real time |
+| `-vga std` | Uses standard VGA emulation, which correctly exposes the linear framebuffer that GRUB requests at 1024×768×32 bpp |
+| `-nic user,model=rtl8139` | Attaches a virtual RTL8139 NIC using QEMU's user-mode networking. The guest receives IP `10.0.2.15` and can reach the internet through NAT |
+| `-enable-kvm` | Enables KVM hardware-accelerated virtualization for near-native performance. Omitted by `make run-nokvm` |
+
+## Boot menu
+
+After GRUB hands off to the kernel, SilverOS completes hardware initialization (GDT, IDT, PIC, PMM, heap, PCI, RTL8139, ATA, SilverFS, RTC, and user system) and then displays its own graphical boot menu over a dark blue background:
+
+```
+        SilverOS Boot Menu
+
+   [ 1. Start SilverOS Desktop ]
+     2. Start Minimal Shell
+
+      Use Up/Down and Enter
+```
+
+- **Navigate** with the **Up** and **Down** arrow keys, or press **1** or **2** directly.
+- **Confirm** your selection with **Enter**.
+- The highlighted option is shown with a blue selection bar.
+
+## Logging in
+
+Both boot modes require authentication before proceeding. Credentials are managed by the kernel's user subsystem, initialized during boot by `user_init()` in `kernel/user.c`.
+
+<Note>
+  The default username and password are defined in `kernel/user.c` inside `user_init()`. Check that source file for the credentials set at compile time. There is currently no runtime mechanism to change passwords.
+</Note>
+
+In **desktop mode** a graphical login screen is shown by `desktop_init()` before the desktop proper is displayed. In **minimal shell mode** a text-mode login prompt is rendered directly on the console.
+
+## Desktop mode
+
+After a successful desktop login, SilverOS launches its graphical environment via `desktop_run()`, which never returns:
+
+- A **gradient desktop background** fills the 1024×768 framebuffer.
+- A **taskbar** runs across the bottom of the screen, containing a "Silver" application menu on the left and a live **clock** widget powered by the RTC driver on the right.
+- A basic **window manager** handles rendering and input routing for desktop windows.
+- A **file browser** (`desktop/filebrowser.c`) lets you navigate the SilverFS filesystem mounted from `build/disk.svd`.
+
+The boot animation (`drivers/bootanim.c`) plays once between the boot menu confirmation and the login screen.
+
+## Minimal shell mode
+
+Choosing option 2 at the boot menu starts a full-screen text-mode console. After login you are dropped into a simple interactive shell with a `> ` prompt. The following built-in commands are available:
+
+| Command | Action |
+|---------|--------|
+| `help` | Prints the list of available commands |
+| `ls` | Lists all entries in the SilverFS root directory (`/`) |
+| `clear` | Clears the console screen |
+| `reboot` | Reboots the machine by pulsing the keyboard controller reset line (`0x64` ← `0xFE`) |
+
+Any unrecognized input prints `Unknown command: <input>`. There is no PATH lookup, no pipes, and no redirection — this is intentionally minimal.
+
+## Serial output
+
+With `-serial stdio` active, the full kernel boot log streams to your host terminal in real time. This is the primary debugging interface for SilverOS. A typical boot sequence looks like:
+
+```
+=================================
+  SilverOS v0.1.0 — Booting...
+=================================
+
+[BOOT] Multiboot2 magic OK: 0x36d76289
+[BOOT] Multiboot2 info at: 0x...
+[INIT] GDT...OK
+[INIT] PIC...OK
+[INIT] IDT...OK
+[INIT] Memory: 256 MB
+[INIT] PMM...OK
+[INIT] HEAP...OK
+[INIT] Keyboard...OK
+[INIT] Mouse...OK
+[INIT] Enabling interrupts...OK
+[INIT] Timer...OK
+[INIT] Enumerating PCI Bus...
+[INIT] Setting up Storage & SilverFS...
+[RTC] Current hardware time: 2025-xx-xx xx:xx:xx
+[INIT] User system ready.
+```
+
+After booting into the desktop, the serial log ends with:
+
+```
+=================================
+  SilverOS Ready!
+=================================
+```
+
+Serial output is invaluable when the framebuffer is not available or when debugging crashes before graphics initialization.
+
+## Flashing to USB
+
+To run SilverOS on real x86_64 hardware, flash the ISO to a USB drive with:
+
+```bash
+make usb DEV=/dev/sdX
+```
+
+Replace `/dev/sdX` with the actual device node of your USB drive (e.g. `/dev/sdb`). The Makefile writes the ISO to the beginning of the device and appends the SilverFS disk image at a 64 MB offset so the kernel can find its filesystem on the same physical drive.
+
+<Warning>
+  This command runs `sudo dd` directly to the block device. It will **permanently destroy all data** on the specified drive. Verify the correct device with `lsblk` before running the command.
+</Warning>

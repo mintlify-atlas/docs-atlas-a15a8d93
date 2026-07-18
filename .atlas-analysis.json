@@ -1,0 +1,118 @@
+{
+  "projectType": "general",
+  "projectName": "SilverOS",
+  "projectDescription": "A bare-metal x86_64 operating system written in C and Assembly, featuring a graphical desktop environment, custom filesystem, network stack, and hardware drivers.",
+  "theme": "aspen",
+  "primaryColor": "#6878C8",
+  "lightColor": "#8898E8",
+  "darkColor": "#3040A0",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "building",
+              "running"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/boot",
+              "architecture/memory"
+            ]
+          },
+          {
+            "group": "Kernel",
+            "pages": [
+              "kernel/interrupts",
+              "kernel/memory-management",
+              "kernel/timers"
+            ]
+          },
+          {
+            "group": "Drivers",
+            "pages": [
+              "drivers/framebuffer",
+              "drivers/input",
+              "drivers/storage",
+              "drivers/serial"
+            ]
+          },
+          {
+            "group": "Filesystem",
+            "pages": [
+              "filesystem/silverfs",
+              "filesystem/mkfs-svd"
+            ]
+          },
+          {
+            "group": "Networking",
+            "pages": [
+              "networking/overview",
+              "networking/protocols"
+            ]
+          },
+          {
+            "group": "Desktop Environment",
+            "pages": [
+              "desktop/overview",
+              "desktop/window-manager",
+              "desktop/terminal"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multiboot2-compliant x86_64 kernel loaded at 1 MB",
+    "32-bit RGB linear framebuffer with double-buffering",
+    "Custom SilverFS filesystem on ATA/PIO block storage",
+    "RTL8139 Ethernet driver with ARP, IPv4, and ICMP (ping) support",
+    "Windowed graphical desktop environment with taskbar, login screen, and Z-ordering window manager",
+    "Built-in terminal application with shell commands (ls, cat, mkdir, ping, free, date)",
+    "PS/2 keyboard and mouse drivers with interrupt-driven input",
+    "Physical memory manager (bitmap-based) and kernel heap allocator",
+    "GDT, IDT, PIC, and TSS hardware initialization",
+    "Host-side mkfs_svd tool for creating SilverFS virtual disk images",
+    "QEMU-runnable ISO image with GRUB2 Multiboot2 bootloader",
+    "Serial port debug output on COM1"
+  ],
+  "publicApiSurface": [
+    "kernel_main(uint64_t multiboot_info_addr, uint64_t magic)",
+    "gdt_init(void)",
+    "idt_init(void) / idt_set_handler(uint8_t n, isr_handler_t handler)",
+    "pic_init(void) / pic_send_eoi(uint8_t irq) / pic_set_mask / pic_clear_mask",
+    "timer_init(uint32_t frequency) / sleep_ms(uint32_t ms) / timer_get_ticks(void)",
+    "pmm_init / pmm_alloc_page / pmm_free_page / pmm_get_free_pages",
+    "heap_init / kmalloc / kcalloc / krealloc / kfree",
+    "fb_init / fb_put_pixel / fb_fill_rect / fb_draw_rect / fb_draw_line / fb_swap_buffers / fb_blend",
+    "console_init / console_putc / console_puts / console_clear / kprintf",
+    "font_draw_char / font_draw_string / font_draw_string_scaled",
+    "keyboard_init / keyboard_getchar / keyboard_getchar_nb / keyboard_haschar",
+    "mouse_init / mouse_get_state / mouse_clear_clicks",
+    "ata_init / ata_read_sector / ata_write_sector / ata_read_sectors / ata_write_sectors",
+    "silverfs_format / silverfs_mount / silverfs_create / silverfs_open / silverfs_read / silverfs_write / silverfs_close / silverfs_mkdir / silverfs_readdir / silverfs_delete / silverfs_stat",
+    "rtl8139_init / rtl8139_send_packet",
+    "net_init / net_receive_packet / net_checksum",
+    "ethernet_send(mac_addr_t dest, uint16_t type, void *payload, uint16_t payload_len)",
+    "arp_init / arp_request / arp_resolve / arp_handle_packet",
+    "ipv4_send / ipv4_handle_packet",
+    "icmp_send_echo_request / icmp_handle_packet",
+    "pci_scan_bus / pci_find_device / pci_read_config / pci_write_config",
+    "rtc_init / rtc_get_time(rtc_time_t *time)",
+    "serial_init / serial_putc / serial_puts / serial_printf",
+    "desktop_init / desktop_run",
+    "window_create / window_destroy / window_set_draw_callback / window_set_key_callback / window_set_click_callback / window_get",
+    "terminal_open / file_browser_open(const char *path)",
+    "user_init / user_login / user_get_current_uid / user_get_current_username / user_create",
+    "bootanim_play(void)",
+    "mkfs_svd <output.svd> (host tool)"
+  ]
+}

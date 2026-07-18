@@ -1,0 +1,162 @@
+---
+title: "Framebuffer Driver: Double-Buffered Graphics in SilverOS"
+sidebarTitle: "Framebuffer"
+description: "SilverOS renders to a 32-bit linear framebuffer obtained from Multiboot2. Covers the double-buffer design, drawing API, color helpers, and font rendering."
+---
+
+The SilverOS framebuffer driver provides the foundation for all visual output in the system. At boot, the kernel reads the framebuffer address, dimensions, pitch, and bit depth directly from the Multiboot2 `framebuffer` tag and stores them in a global `framebuffer_t` struct. All drawing operations target an in-memory back buffer; a single call to `fb_swap_buffers()` pushes the finished frame to VRAM, eliminating screen tearing without requiring any hardware acceleration.
+
+## Framebuffer structure
+
+The `framebuffer_t` struct captures every parameter needed to address and draw into the display. The global `fb` instance is populated once by `fb_init()` and remains valid for the lifetime of the kernel.
+
+```c
+typedef struct {
+    uint32_t *buffer;       /* Front buffer (VRAM) */
+    uint32_t *back_buffer;  /* Back buffer for double buffering */
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  pitch;        /* Bytes per scanline */
+    uint8_t   bpp;          /* Bits per pixel */
+} framebuffer_t;
+
+extern framebuffer_t fb;  /* global framebuffer state */
+```
+
+`buffer` points directly into VRAM at the physical address provided by the bootloader. `back_buffer` points to a static array in BSS that all drawing functions write to. `pitch` may be larger than `width * 4` if the display hardware adds padding at the end of each scanline, so `fb_swap_buffers()` uses `pitch` rather than `width` when indexing into `buffer`.
+
+## Color macros
+
+Colors are represented as 32-bit `uint32_t` values in ARGB format (alpha in the most-significant byte). Two construction macros and a set of named constants are provided:
+
+```c
+#define RGB(r, g, b)      ((uint32_t)(0xFF000000 | ((r) << 16) | ((g) << 8) | (b)))
+#define RGBA(r, g, b, a)  ((uint32_t)(((a) << 24) | ((r) << 16) | ((g) << 8) | (b)))
+
+/* Built-in named colors */
+#define COLOR_BLACK        RGB(0, 0, 0)
+#define COLOR_WHITE        RGB(255, 255, 255)
+#define COLOR_SILVER       RGB(192, 192, 192)
+#define COLOR_DARK_SILVER  RGB(128, 128, 128)
+#define COLOR_RED          RGB(220, 50, 50)
+#define COLOR_GREEN        RGB(50, 200, 50)
+#define COLOR_BLUE         RGB(50, 100, 220)
+```
+
+`RGB` always sets alpha to 0xFF (fully opaque). Use `RGBA` when you need a custom alpha value to pass to `fb_blend()`.
+
+## Drawing API
+
+All functions below write into `fb.back_buffer`. Call `fb_swap_buffers()` after compositing the full frame.
+
+```c
+void     fb_init(struct multiboot2_tag_framebuffer *fb_tag);
+void     fb_put_pixel(int x, int y, uint32_t color);
+uint32_t fb_get_pixel(int x, int y);
+void     fb_fill_rect(int x, int y, int w, int h, uint32_t color);
+void     fb_draw_rect(int x, int y, int w, int h, uint32_t color);  /* outline only */
+void     fb_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
+void     fb_fill_screen(uint32_t color);
+void     fb_draw_gradient_v(int x, int y, int w, int h, uint32_t c1, uint32_t c2);
+void     fb_draw_gradient_h(int x, int y, int w, int h, uint32_t c1, uint32_t c2);
+void     fb_swap_buffers(void);  /* copies back buffer to VRAM */
+void     fb_blit_region(int x, int y, int w, int h, uint32_t *src);
+uint32_t fb_blend(uint32_t bg, uint32_t fg, uint8_t alpha);
+```
+
+| Function | Description |
+|---|---|
+| `fb_init` | Parses the Multiboot2 framebuffer tag, stores dimensions/pitch/bpp in `fb`, zeroes the back buffer, and logs the result to serial. |
+| `fb_put_pixel` | Writes a single pixel to the back buffer at `(x, y)`. Clips silently if out of bounds. |
+| `fb_get_pixel` | Reads the current back-buffer value at `(x, y)`. Returns 0 if out of bounds. |
+| `fb_fill_rect` | Fills a solid axis-aligned rectangle. Clips each pixel individually. |
+| `fb_draw_rect` | Draws the four edges of a rectangle without filling the interior. |
+| `fb_draw_line` | Draws an anti-aliasing-free line between two points using Bresenham's algorithm. |
+| `fb_fill_screen` | Sets every pixel in the back buffer to `color` in a single loop. |
+| `fb_draw_gradient_v` | Fills a rectangle with a top-to-bottom linear interpolation between `c1` and `c2`. |
+| `fb_draw_gradient_h` | Fills a rectangle with a left-to-right linear interpolation between `c1` and `c2`. |
+| `fb_swap_buffers` | Copies the back buffer to VRAM line-by-line. Must be called once per frame to make drawing visible. |
+| `fb_blit_region` | Copies a `w×h` pixel array from `src` onto the back buffer at `(x, y)`. Used for image/sprite blitting. |
+| `fb_blend` | Alpha-blends foreground color `fg` over background color `bg` using an explicit 8-bit `alpha` (0 = fully transparent, 255 = fully opaque). |
+
+## Double buffering
+
+Every drawing function writes exclusively to `fb.back_buffer`, which is a static `uint32_t` array allocated in the kernel's BSS segment. The front buffer (`fb.buffer`) is the VRAM region mapped directly from the physical address provided by Multiboot2 — writes to it appear on screen immediately.
+
+`fb_swap_buffers()` bridges the two by copying the back buffer to VRAM one scanline at a time:
+
+```c
+void fb_swap_buffers(void) {
+    uint32_t pitch_pixels = fb.pitch / 4;
+    for (uint32_t y = 0; y < fb.height; y++) {
+        memcpy(&fb.buffer[y * pitch_pixels],
+               &fb.back_buffer[y * fb.width],
+               fb.width * 4);
+    }
+}
+```
+
+The per-row `memcpy` accounts for any scanline padding by indexing the front buffer with `pitch_pixels` rather than `fb.width`. The desktop shell calls `fb_swap_buffers()` exactly once at the end of every frame loop, after all widgets and the cursor have been composed into the back buffer.
+
+<Note>
+  The back buffer is a statically allocated array: `static uint32_t back_buf[1920 * 1080]` in BSS. This reserves roughly 8 MB of kernel memory at compile time and caps the maximum supported resolution at 1920×1080. Resolutions smaller than 1920×1080 work correctly — the driver uses `fb.width` and `fb.height` for all arithmetic; the extra BSS space is simply unused.
+</Note>
+
+## Font rendering
+
+Text is rendered using an 8×16 pixel bitmap font. Each character glyph is encoded as 16 bytes, one bit per pixel per row, and is drawn directly into the back buffer.
+
+```c
+#define FONT_WIDTH  8
+#define FONT_HEIGHT 16
+
+void font_draw_char(int x, int y, char c, uint32_t color);
+void font_draw_string(int x, int y, const char *str, uint32_t color);
+void font_draw_string_scaled(int x, int y, const char *str, uint32_t color, int scale);
+```
+
+| Function | Description |
+|---|---|
+| `font_draw_char` | Renders a single character glyph at pixel position `(x, y)` using `fb_put_pixel` for each set bit. Transparent (zero) bits are not drawn, so the caller must clear the background first if needed. |
+| `font_draw_string` | Calls `font_draw_char` repeatedly, advancing `x` by `FONT_WIDTH` for each character. Does not handle newlines. |
+| `font_draw_string_scaled` | Like `font_draw_string` but renders each bit as a `scale×scale` block, producing larger crisp text without a separate font atlas. |
+
+The bitmap font data is compiled directly into the kernel image, so no file I/O is required before text can appear on screen.
+
+## Console
+
+The text console layer sits on top of the font and framebuffer APIs. It maintains a cursor position in character-grid coordinates and handles common control codes.
+
+```c
+void console_init(void);
+void console_puts(const char *str);
+void console_putc(char c);        /* handles \n, \r, \t, \b */
+void console_clear(void);
+void kprintf(const char *fmt, ...); /* printf to console + serial */
+```
+
+`console_putc` interprets four control characters:
+
+- `\n` — moves the cursor to the start of the next row
+- `\r` — returns the cursor to column 0 without advancing the row
+- `\t` — advances the cursor to the next 4-column tab stop
+- `\b` — moves the cursor one column left and erases the character cell with the console background color (`RGB(15, 15, 25)`)
+
+When the cursor reaches the last row, `console_scroll()` shifts every row of the back buffer up by `FONT_HEIGHT` pixels using `memcpy`, clears the bottom row, and decrements `cursor_y`. This keeps the console scrolling smoothly without allocating a separate character cell array.
+
+`kprintf` is the primary kernel logging function. It formats a string into a 512-byte stack buffer using `vsnprintf`, then calls both `console_puts` (which writes to the back buffer and calls `fb_swap_buffers()`) and `serial_puts`, so every message appears simultaneously on screen and on the serial port.
+
+## Usage example
+
+```c
+/* Draw a filled blue rectangle then a white label */
+fb_fill_rect(100, 100, 200, 40, RGB(30, 60, 180));
+font_draw_string(110, 110, "Hello, SilverOS!", COLOR_WHITE);
+fb_swap_buffers();
+
+/* Vertical gradient background */
+fb_draw_gradient_v(0, 0, fb.width, fb.height,
+                   RGB(25, 25, 50), RGB(40, 45, 65));
+```
+
+Remember that `fb_swap_buffers()` must be called after any sequence of drawing calls that should become visible. Batching all drawing for a frame before swapping avoids partial updates appearing on screen.

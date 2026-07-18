@@ -1,0 +1,135 @@
+---
+title: "GDT, IDT, and PIC: SilverOS Interrupt Infrastructure"
+sidebarTitle: "Interrupts"
+description: "How SilverOS sets up the Global Descriptor Table, Interrupt Descriptor Table, and 8259 PIC to handle hardware interrupts and CPU exceptions."
+---
+
+Before the kernel can respond to hardware events or CPU exceptions, three foundational tables must be established in a specific order: the Global Descriptor Table (GDT) defines the memory segments and privilege model the CPU enforces; the Interrupt Descriptor Table (IDT) maps every possible interrupt vector to a handler function; and the Programmable Interrupt Controller (PIC 8259A) bridges real hardware IRQ lines onto those vectors. Together these three subsystems form the complete interrupt infrastructure that SilverOS drivers and the kernel itself rely on.
+
+## Global Descriptor Table (GDT)
+
+In 64-bit (long) mode, segmentation is largely vestigial — the CPU treats all segment bases as zero and ignores limits for code and data segments. The GDT is still mandatory, however, because the processor uses it to determine the current privilege level (CPL), whether a code segment is 64-bit, and where to find the Task State Segment (TSS). `gdt_init()` populates a static array of seven entries and loads it with a `lgdt` instruction via the `gdt_flush` assembly trampoline.
+
+The seven entries installed by SilverOS are:
+
+| Index | Selector | Purpose |
+|-------|----------|---------|
+| 0 | `0x00` | Null descriptor (required by the ABI) |
+| 1 | `0x08` | 64-bit kernel code segment (`access=0x9A`, `gran=0xA0`) |
+| 2 | `0x10` | 64-bit kernel data segment (`access=0x92`, `gran=0xC0`) |
+| 3 | `0x18` | 64-bit user code segment (`access=0xFA` — ring 3, future use) |
+| 4 | `0x20` | 64-bit user data segment (`access=0xF2` — ring 3, future use) |
+| 5–6 | `0x28` | 64-bit TSS descriptor (occupies two GDT slots) |
+
+After loading the GDT, `gdt_init` executes `ltr $0x28` to load the TSS. The TSS currently exists to hold `rsp0` — the kernel stack pointer the CPU switches to when an interrupt arrives while in user mode.
+
+```c
+struct gdt_entry {
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t  base_middle;
+    uint8_t  access;
+    uint8_t  granularity;
+    uint8_t  base_high;
+} __attribute__((packed));
+
+struct tss_entry {
+    uint32_t reserved0;
+    uint64_t rsp0;   /* kernel stack pointer */
+    uint64_t rsp1;
+    uint64_t rsp2;
+    /* ... */
+} __attribute__((packed));
+
+void gdt_init(void);
+```
+
+## Interrupt Descriptor Table (IDT)
+
+The IDT is an array of 256 64-bit gate descriptors. Each entry holds the full 64-bit address of a handler stub split across three fields (`offset_low`, `offset_mid`, `offset_high`), the code segment selector to switch to (`0x08`, kernel code), an optional IST index, and the type/attribute byte (`0x8E` = present, ring 0, 64-bit interrupt gate). Setting `type_attr` to `0x8E` automatically clears the IF flag on entry so the handler runs with interrupts disabled.
+
+`idt_init()` wires up Assembly stubs for all 256 vectors:
+
+- **Vectors 0–31** — CPU exceptions (`isr0`–`isr31`). The stubs push a synthetic error code for exceptions that do not supply one, then call `isr_common_handler`.
+- **Vectors 32–47** — Hardware IRQs remapped from the 8259A PIC (`irq0`–`irq15`).
+
+A private `isr_handlers[256]` table maps each vector number to an optional C callback. Unhandled exceptions below vector 32 print diagnostic information over the serial port and halt the machine with `cli` + `hlt`.
+
+```c
+struct idt_entry {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t  ist;       /* bits 0-2: IST index */
+    uint8_t  type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t reserved;
+} __attribute__((packed));
+
+struct interrupt_frame {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t int_no, err_code;
+    uint64_t rip, cs, rflags, rsp, ss;
+} __attribute__((packed));
+
+typedef void (*isr_handler_t)(struct interrupt_frame *frame);
+
+void idt_init(void);
+void idt_set_handler(uint8_t n, isr_handler_t handler);
+```
+
+`idt_set_handler(n, handler)` registers a C function as the handler for interrupt vector `n`. The Assembly stub saves all general-purpose registers onto the stack, constructs the `interrupt_frame`, and calls the C handler. Drivers that use this interface include:
+
+| Driver | IRQ | Vector | Registered via |
+|--------|-----|--------|----------------|
+| PIT timer | IRQ0 | 32 | `idt_set_handler(32, timer_handler)` |
+| Keyboard | IRQ1 | 33 | `idt_set_handler(33, keyboard_handler)` |
+| PS/2 mouse | IRQ12 | 44 | `idt_set_handler(44, mouse_handler)` |
+
+## Programmable Interrupt Controller (PIC 8259A)
+
+The IBM PC/AT uses two cascaded 8259A PICs. The master PIC accepts IRQ0–IRQ7 on its input lines; the slave PIC accepts IRQ8–IRQ15 and connects to the master through the cascade line on IRQ2. Without remapping, both PICs fire vectors 0x08–0x0F and 0x70–0x77, which collide with CPU exception vectors. `pic_init()` remaps them:
+
+- **Master PIC** → vectors `0x20`–`0x27` (IRQ0–IRQ7, decimal 32–39)
+- **Slave PIC** → vectors `0x28`–`0x2F` (IRQ8–IRQ15, decimal 40–47)
+
+After remapping, `pic_init` masks every IRQ line (writes `0xFF` to both data ports). IRQs are unmasked on demand via `pic_clear_mask`.
+
+Each IRQ handler **must** call `pic_send_eoi` before returning. For slave IRQs (IRQ8–IRQ15) the EOI must be sent to both the slave and the master; `pic_send_eoi` handles this automatically by checking whether `irq >= 8`.
+
+```c
+#define PIC1_COMMAND 0x20
+#define PIC1_DATA    0x21
+#define PIC2_COMMAND 0xA0
+#define PIC2_DATA    0xA1
+
+void pic_init(void);
+void pic_send_eoi(uint8_t irq);
+void pic_set_mask(uint8_t irq);
+void pic_clear_mask(uint8_t irq);
+```
+
+## Registering an Interrupt Handler
+
+To attach a C function to a hardware IRQ, three steps are required: register the handler with `idt_set_handler`, unmask the IRQ line with `pic_clear_mask`, and ensure interrupts are globally enabled with `sti`. The example below shows the complete pattern for IRQ1 (keyboard):
+
+```c
+/* Example: register a handler for IRQ1 (keyboard, vector 33) */
+static void my_keyboard_handler(struct interrupt_frame *frame) {
+    (void)frame;
+    uint8_t scancode = inb(0x60);
+    /* process scancode */
+    pic_send_eoi(1); /* send EOI for IRQ1 */
+}
+
+/* During init: */
+idt_set_handler(33, my_keyboard_handler);
+pic_clear_mask(1); /* unmask IRQ1 */
+```
+
+`pic_set_mask(irq)` is the inverse — it silences a particular IRQ line without touching the IDT entry, which is useful for temporarily suppressing a device during reconfiguration.
+
+<Note>
+Interrupts are not automatically enabled after `idt_init()` and `pic_init()` return. The kernel must execute `sti()` (or the `sti` instruction directly) to start receiving interrupts. Conversely, wrap any read-modify-write sequences that must not be preempted with a `cli()`/`sti()` pair. Leaving interrupts disabled for extended periods will cause the tick counter to drift and may starve IRQ-driven drivers.
+</Note>

@@ -1,0 +1,211 @@
+---
+title: "Memory Layout and Management in SilverOS"
+sidebarTitle: "Memory"
+description: "SilverOS uses a bitmap physical memory manager and a linked-list heap allocator. Learn the memory map, PMM API, and kmalloc/kfree internals."
+---
+
+SilverOS manages physical memory through two cooperating subsystems: a **bitmap physical memory manager (PMM)** that tracks 4 KB pages, and a **linked-list heap allocator** that carves a fixed 4 MB region into variable-size kernel allocations. There is no virtual memory paging beyond the identity-mapped page tables set up in the assembly entry stub — every address the kernel uses is a direct physical address. This page documents the memory map, both allocators' internals, and their public APIs.
+
+<Note>
+SilverOS does not use demand paging or virtual address translation beyond the identity map established at boot. All physical addresses are directly accessible in the kernel's flat 64-bit address space. PMM and heap addresses are identical to physical machine addresses.
+</Note>
+
+---
+
+## Physical memory map
+
+The regions below describe how physical memory is divided at runtime. Sizes are approximate; `_kernel_end` is determined by the linker and varies with the build.
+
+| Region | Address range | Description |
+|--------|--------------|-------------|
+| IVT / BIOS data | `0x00000000` – `0x000FFFFF` | First 1 MB — real-mode interrupt vector table, BIOS data area, option ROMs. Never touched by the kernel after boot. |
+| Kernel image | `0x00100000` (1 MB) – `_kernel_end` | ELF sections loaded by GRUB2: `.multiboot`, `.text`, `.rodata`, `.data`, `.bss`. Range recorded by linker symbols `_kernel_start` / `_kernel_end`. |
+| First 2 MB guard | `0x00000000` – `0x001FFFFF` | The PMM unconditionally marks every page below `0x200000` as reserved, regardless of the Multiboot2 memory map, to prevent accidental allocation of BIOS or boot structures. |
+| Kernel heap | `0x01000000` (16 MB) – `0x013FFFFF` | 4 MB fixed-size heap managed by `kmalloc` / `kfree`. Defined by `HEAP_START = 0x1000000` and `HEAP_SIZE = 4 * 1024 * 1024` in `kernel.c`. |
+| Free pages | Above `_kernel_end` and above `0x200000` | All pages in `MULTIBOOT2_MEMORY_AVAILABLE` regions that pass the reservation checks are tracked by the PMM bitmap and available for `pmm_alloc_page()`. |
+| Upper memory | Up to ~4 GB | The PMM bitmap supports up to `MAX_PAGES = 1 048 576` pages (4 GB). Pages beyond the installed RAM are never freed and remain marked as used in the bitmap. |
+
+---
+
+## Physical Memory Manager (PMM)
+
+The PMM in `kernel/pmm.c` uses a flat **bitmap**: one bit per 4 KB page, stored in a static `uint8_t page_bitmap[MAX_PAGES / 8]` array. A set bit (`1`) means the page is **in use or reserved**; a clear bit (`0`) means the page is **free**.
+
+### Design constants
+
+```c
+#define PAGE_SIZE  4096
+#define MAX_PAGES  (1024 * 1024)   /* 4 GB / 4 KB = 1 048 576 pages */
+```
+
+The bitmap itself occupies `MAX_PAGES / 8 = 131 072 bytes` (128 KB) in the `.bss` section — a fixed, compile-time cost regardless of installed RAM.
+
+### Initialisation
+
+`pmm_init` is called from `kernel_main` after the Multiboot2 info has been parsed:
+
+```c
+void pmm_init(uint64_t mem_size,
+              struct multiboot2_tag_mmap *mmap_tag,
+              uint64_t kernel_start,
+              uint64_t kernel_end);
+```
+
+The initialisation algorithm:
+
+1. **Mark everything as used** — `memset(page_bitmap, 0xFF, sizeof(page_bitmap))` sets every bit, making the entire address space appear reserved.
+2. **Walk the Multiboot2 memory map** — for each entry with `type == MULTIBOOT2_MEMORY_AVAILABLE`, iterate through its pages and call `bitmap_clear(page)` to mark them free.
+3. **Apply hard reservations** — any page whose physical address is below `kernel_end` *or* below `0x200000` is skipped and stays marked used, regardless of what the memory map says.
+4. **Fallback without a memory map** — if GRUB2 provided no `MMAP` tag, the PMM falls back to freeing pages starting just above `max(kernel_end, 512 pages)`, up to `mem_size / PAGE_SIZE`.
+
+After `pmm_init` returns, `pmm_get_free_pages()` reports the available page count, and the kernel prints something like:
+
+```
+[PMM] Initialized: 65536 total pages tracked, 63200 free pages (246 MB free)
+```
+
+### Public API
+
+```c
+#define PAGE_SIZE 4096
+
+void     pmm_init(uint64_t mem_size, struct multiboot2_tag_mmap *mmap_tag,
+                  uint64_t kernel_start, uint64_t kernel_end);
+void    *pmm_alloc_page(void);
+void     pmm_free_page(void *addr);
+uint64_t pmm_get_free_pages(void);
+```
+
+#### `pmm_alloc_page()`
+
+Scans the bitmap from page index 0 upward for the first clear bit. When found:
+1. Sets the bit (`bitmap_set(i)`) to mark the page in use.
+2. Decrements `free_pages`.
+3. Zeroes the page with `memset(addr, 0, PAGE_SIZE)` — every allocated page is clean.
+4. Returns the physical address `(void *)(i * PAGE_SIZE)`.
+
+Returns `NULL` and logs an error if no free pages remain.
+
+#### `pmm_free_page(addr)`
+
+Converts `addr` to a page index (`addr / PAGE_SIZE`), validates it is within `total_pages` and currently marked used, then calls `bitmap_clear(page)` and increments `free_pages`.
+
+<Warning>
+Passing an address that was not returned by `pmm_alloc_page()`, or double-freeing a page, produces silent bitmap corruption. The PMM performs only basic bounds checking.
+</Warning>
+
+### Bitmap helpers
+
+The three inline helpers used throughout `pmm.c`:
+
+```c
+static inline void bitmap_set(uint64_t page) {
+    page_bitmap[page / 8] |= (1 << (page % 8));
+}
+
+static inline void bitmap_clear(uint64_t page) {
+    page_bitmap[page / 8] &= ~(1 << (page % 8));
+}
+
+static inline bool bitmap_test(uint64_t page) {
+    return page_bitmap[page / 8] & (1 << (page % 8));
+}
+```
+
+---
+
+## Kernel Heap Allocator
+
+The heap allocator in `kernel/heap.c` manages a single contiguous region using an **intrusive singly-linked list of block headers**. It is initialised once and used for all dynamic kernel allocations via `kmalloc` / `kfree`.
+
+### Heap region
+
+```c
+/* kernel.c */
+#define HEAP_START  0x1000000          /* 16 MB physical */
+#define HEAP_SIZE   (4 * 1024 * 1024) /* 4 MB */
+
+heap_init((void *)HEAP_START, HEAP_SIZE);
+```
+
+The heap lives at 16 MB, safely above both the 2 MB reservation boundary and the kernel image, and well below typical installed RAM.
+
+### Block header layout
+
+Every allocation (free or in-use) is prefixed by a `heap_block` header:
+
+```c
+struct heap_block {
+    size_t             size;   /* usable bytes after this header */
+    bool               free;   /* true if this block is available */
+    struct heap_block  *next;  /* pointer to the next header, or NULL */
+};
+```
+
+At `heap_init` time the entire heap is a single free block:
+
+```
+[ heap_block header | ←————— size = HEAP_SIZE - sizeof(heap_block) ————→ ]
+  free=true, next=NULL
+```
+
+### `kmalloc(size)`
+
+```c
+void *kmalloc(size_t size);
+```
+
+1. **Alignment** — `size` is rounded up to the nearest 16-byte boundary using `ALIGN_UP(size, 16)`.
+2. **First-fit search** — the free list is walked from `heap_start`; the first block with `free == true` and `block->size >= size` is selected.
+3. **Block splitting** — if the chosen block is large enough to hold the requested allocation *plus* a new header *plus* at least 64 bytes of usable space (`block->size >= size + sizeof(heap_block) + 64`), the tail is split off as a new free block. This prevents wasting large free blocks on small allocations.
+4. **Mark in use** — `block->free = false`.
+5. **Return** — a pointer to the byte immediately after the header: `(void *)((uint8_t *)block + sizeof(heap_block))`.
+
+Returns `NULL` and logs an error if no suitable block exists.
+
+### `kfree(ptr)`
+
+```c
+void kfree(void *ptr);
+```
+
+1. Recovers the block header: `block = (heap_block *)((uint8_t *)ptr - sizeof(heap_block))`.
+2. Sets `block->free = true`.
+3. **Forward coalesce** — if `block->next` is also free, merges it into `block` by absorbing its size and header, and skipping its pointer.
+4. **Backward coalesce** — walks from `heap_start` to find the block whose `next` points to `block`. If that predecessor is free, the predecessor absorbs `block`.
+
+Together these two coalescing passes ensure that consecutive frees always produce a single large free block rather than a fragmented chain.
+
+### `kcalloc` and `krealloc`
+
+```c
+void *kcalloc(size_t count, size_t size);
+void *krealloc(void *ptr, size_t new_size);
+```
+
+- **`kcalloc`** — calls `kmalloc(count * size)` and zeroes the result with `memset`.
+- **`krealloc`** — if the existing block is already large enough, returns `ptr` unchanged. Otherwise `kmalloc`s a new region, `memcpy`s the old content (up to `block->size` bytes), `kfree`s the original, and returns the new pointer.
+
+### Public API
+
+```c
+void  heap_init(void *start, size_t size);
+void *kmalloc(size_t size);
+void *kcalloc(size_t count, size_t size);
+void *krealloc(void *ptr, size_t new_size);
+void  kfree(void *ptr);
+```
+
+<Tip>
+Prefer `kcalloc` over `kmalloc` when allocating structs that will be partially written — the zero initialisation prevents stale pointer bugs from unset fields.
+</Tip>
+
+---
+
+## Address space overview
+
+SilverOS runs entirely in **ring 0** with a single flat 64-bit address space. The page tables built in `boot.asm` identity-map the first 4 GB using 2 MB huge pages, so virtual address N equals physical address N for all addresses in that range. There is no user-space ring-3 separation, no ASLR, and no demand paging in the current version.
+
+<Note>
+Because all addresses are identity-mapped physical addresses, both `pmm_alloc_page()` and `kmalloc()` return pointers that are directly dereferenceable in C — no `mmap` or virtual-address translation step is required.
+</Note>

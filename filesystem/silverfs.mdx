@@ -1,0 +1,257 @@
+---
+title: "SilverFS: Custom Inode Filesystem for SilverOS"
+sidebarTitle: "SilverFS"
+description: "SilverFS is SilverOS's native block-device filesystem. Learn its on-disk layout, inode and directory entry structures, and the full kernel-side C API."
+---
+
+SilverFS is the native persistent filesystem built into SilverOS. It is an inode-based, block-device filesystem designed specifically for simplicity and direct integration with the kernel's ATA driver. Rather than relying on an existing filesystem standard like FAT or ext2, SilverFS provides a minimal but complete feature set: hierarchical directories, file creation and deletion, random-access reads and writes, and persistence across reboots — all stored on a raw ATA disk image (`.svd`) passed to QEMU as a virtual hard drive.
+
+## On-disk layout
+
+SilverFS divides the disk into fixed-size **4096-byte blocks**. The first 22 blocks are reserved for filesystem metadata; all remaining blocks are available as data blocks.
+
+| Block(s) | Content |
+|---|---|
+| 0 | Superblock (`silverfs_superblock_t`) |
+| 1 | Inode bitmap (1024 bits = 128 bytes used, rest zeroed) |
+| 2 | Block bitmap (4096 bits = 512 bytes used, rest zeroed) |
+| 3–21 | Inode table (1024 inodes × 76 bytes ≈ 19 blocks) |
+| 22+ | Data blocks |
+
+The superblock holds the volume metadata and the offsets of each subsequent region. Bitmaps are loaded into kernel RAM on mount and flushed back to disk after every allocation or free. The inode table is accessed with a read-modify-write strategy — the kernel reads the relevant 4096-byte block, updates the target inode in place, and writes the block back.
+
+<Note>
+  SilverFS is persisted on the ATA disk (`build/disk.svd`) and survives QEMU reboots as long as `disk.svd` is not regenerated. Any files written during a session remain intact on the next boot. Regenerating the disk via `make disk` or `make` wipes all data.
+</Note>
+
+## Data structures
+
+The following constants and types are defined in `include/silverfs.h` and describe the complete on-disk and in-memory representation of the filesystem.
+
+```c
+#define SILVERFS_MAGIC         0x53494C56  /* "SILV" */
+#define SILVERFS_BLOCK_SIZE    4096
+#define SILVERFS_MAX_NAME      255
+#define SILVERFS_DIRECT_BLOCKS 12
+#define SILVERFS_MAX_INODES    1024
+#define SILVERFS_MAX_BLOCKS    4096
+
+/* Superblock — stored at Block 0 */
+typedef struct {
+    uint32_t magic;            /* 0x53494C56 "SILV" */
+    uint32_t block_size;       /* always 4096 */
+    uint32_t total_blocks;
+    uint32_t total_inodes;
+    uint32_t free_blocks;
+    uint32_t free_inodes;
+    uint32_t inode_table_block;
+    uint32_t data_block_start;
+    uint32_t root_inode;       /* always 0 */
+    uint8_t  volume_name[32];
+} silverfs_superblock_t;
+
+/* Inode — one per file or directory */
+typedef struct {
+    uint32_t type;             /* SILVERFS_TYPE_FILE or SILVERFS_TYPE_DIR */
+    uint32_t size;             /* file size in bytes */
+    uint32_t block_count;
+    uint32_t blocks[12];       /* direct block pointers */
+    uint32_t indirect_block;   /* reserved, not implemented */
+    uint32_t created_time;
+    uint32_t modified_time;
+    uint16_t permissions;      /* Unix-style, e.g. 0644 */
+    uint16_t link_count;
+} silverfs_inode_t;
+
+/* Directory entry — packed inside a directory's data blocks */
+typedef struct {
+    uint32_t inode;
+    uint8_t  name_len;
+    char     name[255];
+} silverfs_dirent_t;
+
+/* File handle — held by the caller between open and close */
+typedef struct {
+    uint32_t inode_idx;
+    uint32_t offset;
+    bool     open;
+} silverfs_file_t;
+```
+
+`SILVERFS_TYPE_FILE` is `1` and `SILVERFS_TYPE_DIR` is `2`. New files are created with permissions `0644`; new directories with `0755`. The `indirect_block` field in `silverfs_inode_t` is reserved and never populated by the current kernel implementation.
+
+## Filesystem API
+
+All public functions are declared in `include/silverfs.h` and implemented in `fs/silverfs.c`. Every function that returns `int` returns `0` on success and `-1` on failure unless documented otherwise.
+
+### `silverfs_format`
+
+```c
+int silverfs_format(void);
+```
+
+Stub — the kernel implementation prints a warning and returns `-1`. All formatting must be done on the host using the [`mkfs_svd`](/filesystem/mkfs-svd) tool before booting SilverOS.
+
+---
+
+### `silverfs_mount`
+
+```c
+int silverfs_mount(void);
+```
+
+Reads the superblock from the ATA disk at LBA 0 and validates the `SILV` magic (`0x53494C56`). If the magic is not found at offset 0, it retries at LBA offset `131072` (a legacy fallback). On success it loads the inode bitmap (Block 1) and block bitmap (Block 2) into kernel RAM and prints the volume name to the serial port. Returns `0` on success, `-1` if no valid superblock is found.
+
+---
+
+### `silverfs_create`
+
+```c
+int silverfs_create(const char *path, uint32_t type);
+```
+
+Creates a new file (`SILVERFS_TYPE_FILE`) or directory (`SILVERFS_TYPE_DIR`) at the given absolute path. The parent directory must already exist. Returns `-1` if the path already exists, if the parent is not found, or if no free inodes or blocks are available.
+
+---
+
+### `silverfs_open`
+
+```c
+int silverfs_open(const char *path, silverfs_file_t *file);
+```
+
+Resolves `path` to an inode, then sets `file->inode_idx` to the inode index, `file->offset` to `0`, and `file->open` to `true`. Returns `0` on success or `-1` if the path does not exist.
+
+---
+
+### `silverfs_read`
+
+```c
+int silverfs_read(silverfs_file_t *file, void *buf, size_t count);
+```
+
+Reads up to `count` bytes from the file's current offset into `buf`. The read is clipped to the end of the file automatically. Advances `file->offset` by the number of bytes read. Returns the number of bytes actually read, or `-1` if the file handle is not open.
+
+---
+
+### `silverfs_write`
+
+```c
+int silverfs_write(silverfs_file_t *file, const void *buf, size_t count);
+```
+
+Writes `count` bytes from `buf` into the file at the current offset, allocating new data blocks from the block bitmap as needed. Uses a read-modify-write strategy per block to avoid clobbering data in partially-written blocks. Advances `file->offset` and updates `inode.size` on disk after each block write. Returns the number of bytes written, or `-1` if the file handle is not open.
+
+---
+
+### `silverfs_close`
+
+```c
+void silverfs_close(silverfs_file_t *file);
+```
+
+Marks the file handle as closed by setting `file->open = false`. No data is flushed at close time — all writes go directly to disk as they occur.
+
+---
+
+### `silverfs_mkdir`
+
+```c
+int silverfs_mkdir(const char *path);
+```
+
+Creates a directory at `path`. This is a thin wrapper around `silverfs_create(path, SILVERFS_TYPE_DIR)`. Returns `0` on success or `-1` on failure.
+
+---
+
+### `silverfs_readdir`
+
+```c
+int silverfs_readdir(const char *path, silverfs_dirent_t *entries, int max_entries);
+```
+
+Iterates all data blocks of the directory at `path` and fills `entries` with every `silverfs_dirent_t` whose `inode` field is non-zero (i.e., is a valid entry). Stops after `max_entries` entries are collected. Returns the total count of entries found, or `-1` if `path` does not exist or is not a directory.
+
+---
+
+### `silverfs_delete`
+
+```c
+int silverfs_delete(const char *path);
+```
+
+Frees all direct data blocks belonging to the inode at `path`, clears the inode bitmap bit, zeroes the inode on disk, and removes the corresponding `silverfs_dirent_t` from the parent directory's data block. Returns `0` on success or `-1` if the path is not found.
+
+---
+
+### `silverfs_stat`
+
+```c
+int silverfs_stat(const char *path, silverfs_inode_t *inode);
+```
+
+Resolves `path` to an inode index and copies the full `silverfs_inode_t` into `*inode`. Returns `0` on success or `-1` if the path does not exist.
+
+## Code examples
+
+### Write a text file
+
+```c
+/* Create and write a file */
+silverfs_create("/home/user/hello.txt", SILVERFS_TYPE_FILE);
+
+silverfs_file_t f;
+silverfs_open("/home/user/hello.txt", &f);
+silverfs_write(&f, "Hello, SilverOS!\n", 17);
+silverfs_close(&f);
+```
+
+### Read a file back
+
+```c
+silverfs_file_t r;
+silverfs_open("/home/user/hello.txt", &r);
+
+char buf[256];
+int n = silverfs_read(&r, buf, sizeof(buf) - 1);
+buf[n] = '\0';
+silverfs_close(&r);
+```
+
+### List a directory
+
+```c
+silverfs_dirent_t entries[32];
+int count = silverfs_readdir("/", entries, 32);
+for (int i = 0; i < count; i++) {
+    kprintf("  %s\n", entries[i].name);
+}
+```
+
+### Stat a file
+
+```c
+silverfs_inode_t info;
+if (silverfs_stat("/etc/hostname", &info) == 0) {
+    kprintf("size=%u permissions=%o\n", info.size, info.permissions);
+}
+```
+
+### Create a directory tree
+
+```c
+silverfs_mkdir("/home");
+silverfs_mkdir("/home/user");
+silverfs_mkdir("/etc");
+```
+
+## Limitations
+
+SilverFS is intentionally minimal. Be aware of the following constraints:
+
+- **Maximum 1024 inodes** (`SILVERFS_MAX_INODES`) and **4096 blocks** (`SILVERFS_MAX_BLOCKS`) per volume.
+- **No indirect block support** — `indirect_block` in `silverfs_inode_t` is reserved but never used. The maximum file size is `12 × 4096 = 48 KB`.
+- **No runtime timestamps** — `created_time` and `modified_time` fields exist in the inode structure but are never set or updated by the kernel. They will always read as `0`.
+- **No hard links** — `link_count` is always set to `1` for files and `2` for directories; there is no mechanism to create additional links.
+- **Absolute paths only** — all path arguments passed to any SilverFS function must begin with `/`. Relative paths will cause `resolve_path` to return `-1`.
+- **No symbolic links, permissions enforcement, or access-control** — the `permissions` field is stored but never checked by the kernel.

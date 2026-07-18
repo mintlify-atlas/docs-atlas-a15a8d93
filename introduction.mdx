@@ -1,0 +1,62 @@
+---
+title: "SilverOS: A Bare-Metal x86_64 Operating System"
+sidebarTitle: "Introduction"
+description: "SilverOS is a from-scratch x86_64 OS in C and Assembly with a graphical desktop, custom SilverFS filesystem, RTL8139 networking, and full hardware driver suite."
+---
+
+SilverOS is a from-scratch, bare-metal operating system targeting the x86_64 architecture. Written entirely in C (gnu11 dialect) and NASM x86_64 Assembly, it boots via GRUB2 with Multiboot2, initializes hardware directly without any underlying OS, and launches either a graphical desktop environment or a text-mode minimal shell. SilverOS is built for OS developers, systems-programming students, and hobbyists who want a readable, well-structured reference kernel — one that goes from power-on to a working desktop without borrowing a single byte from an existing OS.
+
+<Note>
+  SilverOS is primarily developed and tested under QEMU, which provides fast iteration cycles and easy debugging via serial output. The kernel is also designed to run on real x86_64 hardware — any machine that can boot a GRUB2 ISO will work.
+</Note>
+
+## What SilverOS includes
+
+<CardGroup cols={2}>
+  <Card title="Kernel Subsystem" icon="microchip">
+    GDT, IDT, PIC, and PIT initialization. Physical memory manager (PMM), slab heap allocator, serial debug output, and a full Multiboot2 info parser. Kernel entry point is `kernel_main` in `kernel/kernel.c`.
+  </Card>
+  <Card title="SilverFS Filesystem" icon="hard-drive">
+    A custom filesystem stored in a virtual disk image (`build/disk.svd`). The host-side `mkfs_svd` tool formats the image; the kernel mounts it via `silverfs_mount()` at boot and falls back to `silverfs_format()` if no valid volume is found.
+  </Card>
+  <Card title="Network Stack" icon="network-wired">
+    A layered network stack: RTL8139 NIC driver, Ethernet framing, ARP, IPv4, and ICMP. In QEMU the virtual NIC is assigned `10.0.2.15` via the built-in user-mode networking backend.
+  </Card>
+  <Card title="Desktop Environment" icon="desktop">
+    A graphical desktop rendered at 1024×768×32 bpp through the Multiboot2 linear framebuffer. Features a gradient background, taskbar with a "Silver" application menu, a real-time clock widget, and a basic window manager.
+  </Card>
+  <Card title="Hardware Drivers" icon="plug">
+    PS/2 keyboard and mouse, ATA/IDE disk, RTC (real-time clock), VGA framebuffer with double-buffering, a bitmap font renderer, boot animation, and a full-screen software console.
+  </Card>
+  <Card title="Host Tools" icon="wrench">
+    `tools/mkfs_svd.c` is compiled as a native Linux binary during the build. It creates and formats the `build/disk.svd` virtual disk image that the kernel mounts at runtime.
+  </Card>
+</CardGroup>
+
+## Project layout
+
+The SilverOS source tree is organized into focused directories, each owning a single layer of the system:
+
+| Directory | Contents |
+|-----------|----------|
+| `boot/` | `boot.asm` (Multiboot2 header + 64-bit entry stub), `linker.ld` (kernel loaded at 1 MB physical), `grub.cfg` (GRUB2 menu and framebuffer mode request) |
+| `kernel/` | `kernel.c` (main entry point, all boot phases), plus `gdt.c`, `idt.c`, `pic.c`, `timer.c`, `pmm.c`, `heap.c`, `pci.c`, `user.c`, `serial.c`, `string.c`, and two Assembly helpers (`isr.asm`, `gdt_idt_flush.asm`) |
+| `drivers/` | `framebuffer.c`, `font.c`, `keyboard.c`, `mouse.c`, `bootanim.c`, `console.c`, `ata.c`, `rtc.c`, `rtl8139.c` |
+| `fs/` | `silverfs.c` — the SilverFS filesystem driver |
+| `net/` | `net.c`, `ethernet.c`, `arp.c`, `ipv4.c`, `icmp.c` — the full network stack |
+| `desktop/` | `desktop.c` (window manager, login screen, taskbar), `filebrowser.c` |
+| `include/` | All public header files: `types.h`, `string.h`, `multiboot2.h`, `io.h`, and one header per subsystem |
+| `tools/` | `mkfs_svd.c` — host-side disk image formatter, compiled to `build/mkfs_svd` |
+
+## What SilverOS is NOT
+
+SilverOS is a kernel and driver showcase, not a general-purpose OS. The following are explicitly out of scope for the current codebase — they are planned as future work:
+
+- **No userspace** — there are no user-mode processes, no ELF loader, and no system-call interface.
+- **No POSIX** — no `libc`, no file-descriptor table, no standard I/O. The kernel uses its own freestanding `string.h` and `types.h`.
+- **No multitasking scheduler** — the kernel runs a single cooperative execution path. Context switching and process scheduling are not yet implemented.
+- **No virtual memory / paging** — the PMM manages physical pages; there is no page-table setup beyond what GRUB provides.
+
+## License
+
+SilverOS is released under the **GNU General Public License v2.0** (GPL-2.0). See the `LICENSE` file at the repository root for the full license text.
