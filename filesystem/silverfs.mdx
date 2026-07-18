@@ -1,5 +1,5 @@
 ---
-title: "SilverFS: Custom Inode Filesystem for SilverOS"
+title: "SilverFS: Persistent Inode Filesystem for SilverOS"
 sidebarTitle: "SilverFS"
 description: "SilverFS is SilverOS's native block-device filesystem. Learn its on-disk layout, inode and directory entry structures, and the full kernel-side C API."
 ---
@@ -35,6 +35,7 @@ The following constants and types are defined in `include/silverfs.h` and descri
 #define SILVERFS_DIRECT_BLOCKS 12
 #define SILVERFS_MAX_INODES    1024
 #define SILVERFS_MAX_BLOCKS    4096
+#define SILVERFS_MAX_FILES     256
 
 /* Superblock — stored at Block 0 */
 typedef struct {

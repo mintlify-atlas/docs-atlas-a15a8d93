@@ -1,10 +1,10 @@
 ---
 title: "SilverOS Network Stack: RTL8139, ARP, IPv4, and ICMP"
 sidebarTitle: "Overview"
-description: "SilverOS includes a minimal network stack built on an RTL8139 Ethernet driver, supporting ARP resolution, IPv4 packet I/O, and ICMP ping requests and replies."
+description: "SilverOS implements a bare-metal network stack on the RTL8139 NIC, covering ARP resolution, IPv4 routing, and ICMP echo request and reply handling."
 ---
 
-SilverOS ships a purpose-built network stack layered directly over bare-metal x86\_64 hardware. Starting from PCI enumeration and RTL8139 NIC initialisation, the stack climbs through Ethernet II framing, ARP address resolution, and IPv4 routing, up to ICMP echo request and reply handling. There is no operating-system abstraction between your code and the wire — every received frame is dispatched in the RTL8139 IRQ handler and every outbound byte is written directly to an I/O-mapped transmit buffer.
+SilverOS ships a purpose-built network stack layered directly over bare-metal x86\_64 hardware. Starting from PCI enumeration and RTL8139 NIC initialisation, the stack climbs through Ethernet II framing, ARP address resolution, and IPv4 routing, up to ICMP echo request and reply handling. There is no operating-system abstraction between your code and the wire — every outbound byte is written directly to an I/O-mapped transmit buffer, and the RTL8139 IRQ handler is wired to forward received frames into the upper-layer stack once the receive path is enabled (see the note in the [Receiving packets](#receiving-packets) section below).
 
 ## Stack architecture
 
@@ -66,7 +66,7 @@ Both globals are declared in `net/net.c` and are `extern`-visible to every other
 
 ## Receiving packets
 
-When the RTL8139 signals a receive interrupt, the IRQ handler reads the raw Ethernet frame out of the ring buffer and passes it — pointer and byte length — to:
+When the RTL8139 signals a receive interrupt, the IRQ handler reads the raw Ethernet frame out of the ring buffer and has the infrastructure to pass it — pointer and byte length — to `net_receive_packet`. The call is currently commented out in `drivers/rtl8139.c`; uncomment it to connect the hardware receive path to the upper-layer stack (see the note below). Once enabled, the function signature it calls is:
 
 ```c
 void net_receive_packet(void *data, uint16_t len);

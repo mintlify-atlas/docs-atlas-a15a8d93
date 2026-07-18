@@ -1,5 +1,5 @@
 ---
-title: "PIT Timer and Tick-Based Delays in SilverOS"
+title: "PIT Timer and Tick-Based Delays in SilverOS Kernel"
 sidebarTitle: "Timers"
 description: "SilverOS programs the 8253/8254 PIT via timer_init to fire at a configurable frequency and exposes sleep_ms and timer_get_ticks for timing and delays."
 ---
@@ -18,7 +18,7 @@ uint64_t timer_get_ticks(void);          /* returns total tick count since init 
 
 SilverOS calls `timer_init(1000)` during early kernel startup, producing a tick rate of 1000 Hz — one tick per millisecond. The PIT channel 0 input clock runs at a fixed 1.193182 MHz; dividing by the requested frequency gives the 16-bit reload value written to the channel 0 data port (`0x40`).
 
-The command byte `0x36` selects channel 0, lobyte/hibyte access mode, and mode 3 (square wave generator), which is the standard rate-generator mode used by PC-compatible operating systems.
+The command byte `0x36` selects channel 0, lobyte/hibyte access mode, and mode 3 (square wave generator). Mode 3 is widely used by PC-compatible operating systems for periodic timer interrupts because it produces a symmetrical output waveform at the programmed frequency.
 
 ```c
 /* Registered in timer_init: */

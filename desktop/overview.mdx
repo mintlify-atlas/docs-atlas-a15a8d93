@@ -62,6 +62,7 @@ All colours are defined as 32-bit `RGB(r, g, b)` values at the top of `desktop/d
 | Window titlebar (focused) | Brighter slate-blue | `RGB(70, 75, 110)` |
 | Titlebar text | Cool off-white | `RGB(210, 215, 225)` |
 | Window body | Very dark blue | `RGB(30, 30, 48)` |
+| Window border | Dark blue-grey | `RGB(55, 58, 75)` |
 | Close button | Deep red | `RGB(180, 50, 50)` |
 | Close button (hover) | Brighter red | `RGB(220, 70, 70)` |
 | "Silver" menu button | Muted indigo | `RGB(55, 60, 85)` |
@@ -93,7 +94,7 @@ const char *user_get_current_username(void);
 bool        user_create(const char *username, const char *password);
 ```
 
-`user_init()` is called during kernel startup and seeds a default user account. `user_login(username, password)` checks the supplied credentials and, on success, records the current UID so that `user_get_current_uid()` and `user_get_current_username()` return the correct values for the session.
+`user_init()` is called during kernel startup. If `/etc/passwd` does not exist it seeds a single default account with username `root` and password `silver`. `user_login(username, password)` checks the supplied credentials and, on success, records the current UID so that `user_get_current_uid()` and `user_get_current_username()` return the correct values for the session.
 
 The graphical login window behaves as follows:
 
@@ -147,7 +148,7 @@ The start menu is a 160×126-pixel panel that appears just above the "Silver" bu
 | 1 | Terminal | Calls `terminal_open()` |
 | 2 | About | Opens an "About SilverOS" window |
 | — | *(separator)* | Horizontal rule drawn across the menu |
-| 4 | Shutdown | Writes `0x2000` to I/O port `0x604` (ACPI power-off in QEMU) |
+| 4 | Shutdown | Calls `outb(0x604, 0x00)` (ACPI power-off in QEMU) |
 
 Clicking anywhere outside the menu area closes it without taking any action.
 

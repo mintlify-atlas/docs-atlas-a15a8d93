@@ -1,5 +1,5 @@
 ---
-title: "Run SilverOS in QEMU with Networking and Storage"
+title: "Run SilverOS in QEMU: Networking, Storage, and Serial Debug"
 sidebarTitle: "Running"
 description: "Launch SilverOS in QEMU using make run, navigate the boot menu, log in to the desktop, and use the built-in terminal to explore the filesystem."
 ---
@@ -42,8 +42,8 @@ After GRUB hands off to the kernel, SilverOS completes hardware initialization (
 ```
         SilverOS Boot Menu
 
-   [ 1. Start SilverOS Desktop ]
-     2. Start Minimal Shell
+   1. Start SilverOS Desktop    ← selected (blue highlight bar)
+   2. Start Minimal Shell
 
       Use Up/Down and Enter
 ```
@@ -57,7 +57,7 @@ After GRUB hands off to the kernel, SilverOS completes hardware initialization (
 Both boot modes require authentication before proceeding. Credentials are managed by the kernel's user subsystem, initialized during boot by `user_init()` in `kernel/user.c`.
 
 <Note>
-  The default username and password are defined in `kernel/user.c` inside `user_init()`. Check that source file for the credentials set at compile time. There is currently no runtime mechanism to change passwords.
+  On a fresh `build/disk.svd` image, `user_init()` creates a single default account: username `root`, password `silver`. These values are hardcoded in the `user_create("root", "silver")` call inside `kernel/user.c`. On a pre-existing disk image, `user_init()` reads credentials from `/etc/passwd` on the SilverFS volume instead. There is no runtime mechanism to change passwords.
 </Note>
 
 In **desktop mode** a graphical login screen is shown by `desktop_init()` before the desktop proper is displayed. In **minimal shell mode** a text-mode login prompt is rendered directly on the console.

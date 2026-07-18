@@ -1,5 +1,5 @@
 ---
-title: "mkfs_svd: Create a SilverFS Virtual Disk Image"
+title: "mkfs_svd: Format a SilverFS Virtual Disk Image on the Host"
 sidebarTitle: "mkfs_svd"
 description: "mkfs_svd is a host-side C tool that formats a 16 MB .svd file with a valid SilverFS superblock, bitmaps, inode table, and empty root directory."
 ---
@@ -45,7 +45,7 @@ The `silverfs_superblock_t` at byte offset 0 is initialised with:
 | `block_size` | `4096` |
 | `total_blocks` | `4096` |
 | `total_inodes` | `1024` |
-| `free_blocks` | `4096` minus structural blocks |
+| `free_blocks` | `4073` (4096 − 22 structural blocks − 1 root data block) |
 | `free_inodes` | `1023` (inode 0 allocated to root) |
 | `inode_table_block` | `3` |
 | `data_block_start` | `22` |

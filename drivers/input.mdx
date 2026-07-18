@@ -1,5 +1,5 @@
 ---
-title: "PS/2 Keyboard and Mouse Drivers in SilverOS"
+title: "PS/2 Keyboard and Mouse Input Drivers for SilverOS"
 sidebarTitle: "Input"
 description: "SilverOS reads PS/2 keyboard and mouse input via IRQ-driven ring buffers. Documents the keyboard API, special key codes, and mouse state struct."
 ---
@@ -119,7 +119,7 @@ void mouse_clear_clicks(void);
 
 | Function | Description |
 |---|---|
-| `mouse_init` | Enables the PS/2 auxiliary device via the 8042 command port, sets mouse resolution and sample rate, registers the IRQ12 handler, and unmasks IRQ12 in the PIC. |
+| `mouse_init` | Enables the PS/2 auxiliary device via the 8042 command port, resets it to default settings, enables data reporting, registers the IRQ12 handler, and unmasks IRQ12 in the PIC. |
 | `mouse_get_state` | Copies the current internal mouse state into the caller-supplied `mouse_state_t`. This is a non-blocking snapshot — safe to call every frame. |
 | `mouse_clear_clicks` | Clears the `left_clicked` and `left_released` one-shot flags. Must be called after handling a click event to prevent it from being processed on every subsequent frame. |
 
@@ -128,7 +128,7 @@ The distinction between `left_button` and `left_clicked` is important:
 - `left_button` is `true` for as long as the button is physically held down. Use this for drag operations.
 - `left_clicked` is `true` only for frames after the button was first pressed, until `mouse_clear_clicks()` is called. Use this for single-action click events like button presses and icon activations.
 
-Cursor coordinates are clamped to `[0, fb.width]` × `[0, fb.height]` by the IRQ12 handler, so `ms.x` and `ms.y` are always valid pixel positions regardless of how fast the mouse is moved.
+Cursor coordinates are clamped to `[0, fb.width - 1]` × `[0, fb.height - 1]` by the IRQ12 handler, so `ms.x` and `ms.y` are always valid pixel positions regardless of how fast the mouse is moved.
 
 ## Mouse usage in the desktop event loop
 

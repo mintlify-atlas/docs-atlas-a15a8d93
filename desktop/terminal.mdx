@@ -10,7 +10,7 @@ SilverOS ships a graphical terminal emulator built directly into the desktop she
 
 The terminal can be opened in two ways:
 
-1. **Automatically on login** — after `user_login()` succeeds, `desktop_init` calls `terminal_open()` immediately so the terminal is ready the moment the desktop appears.
+1. **Automatically on login** — after `user_login()` succeeds inside the login window's key handler, `terminal_open()` is called immediately so the terminal is ready the moment the desktop becomes interactive.
 2. **From the start menu** — click the **Silver** button in the taskbar, then select **Terminal**.
 
 ```c
@@ -44,7 +44,6 @@ The function `term_process_command` dispatches on the command string using `strc
 | `date` | `date` | Shows hardware date/time from RTC |
 | `ifconfig` | `ifconfig` | Shows MAC and IP address of eth0 |
 | `ping` | `ping 10.0.2.2` | Sends ICMP echo request |
-| `reboot` | `reboot` | Reboots via keyboard controller (`0x64 = 0xFE`) — only in shell mode |
 
 If an unknown string is entered, the terminal prints `Unknown command: <input>`.
 

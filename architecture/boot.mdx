@@ -1,5 +1,5 @@
 ---
-title: "SilverOS Boot Sequence: GRUB2 to kernel_main"
+title: "SilverOS Boot: GRUB2 Multiboot2 Handoff to kernel_main"
 sidebarTitle: "Boot Sequence"
 description: "Follow SilverOS from BIOS power-on through GRUB2 Multiboot2 handoff, the assembly entry stub, and into the C kernel_main initialization phases."
 ---
@@ -100,7 +100,7 @@ What each field means:
 | End tag (type 0) | — | Marks the end of the tag list |
 
 On entry to `_start`, GRUB2 guarantees:
-- `EAX` = `0x36D76289` (`MULTIBOOT2_BOOTLOADER_MAGIC`) — the kernel confirms this before doing anything else.
+- `EAX` = `0x36D76289` (`MULTIBOOT2_BOOTLOADER_MAGIC`) — `kernel_main` validates this against `MULTIBOOT2_BOOTLOADER_MAGIC` immediately after `serial_init()` and halts if the value does not match.
 - `EBX` = physical address of the Multiboot2 info struct.
 
 ## Assembly entry stub (boot.asm)

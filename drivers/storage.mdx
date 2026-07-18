@@ -1,5 +1,5 @@
 ---
-title: "ATA PIO Storage and Real-Time Clock Drivers"
+title: "ATA PIO Storage and Real-Time Clock Drivers in SilverOS"
 sidebarTitle: "Storage"
 description: "SilverOS accesses the virtual ATA disk with PIO sector reads and writes, and reads wall-clock time from the CMOS RTC. Full API reference for ata and rtc."
 ---
@@ -29,7 +29,11 @@ All port addresses, status flag masks, command codes, and functions are declared
 /* Status bits */
 #define ATA_SR_BSY  0x80  /* Drive busy */
 #define ATA_SR_DRDY 0x40  /* Drive ready */
+#define ATA_SR_DF   0x20  /* Drive write fault */
+#define ATA_SR_DSC  0x10  /* Drive seek complete */
 #define ATA_SR_DRQ  0x08  /* Data request ready */
+#define ATA_SR_CORR 0x04  /* Corrected data */
+#define ATA_SR_IDX  0x02  /* Index */
 #define ATA_SR_ERR  0x01  /* Error */
 
 /* Commands */
@@ -48,7 +52,7 @@ void ata_write_sectors(uint32_t lba, uint8_t count, const uint8_t *buffer);
 
 | Function | Description |
 |---|---|
-| `ata_init` | Selects the master drive on the primary bus, waits for `ATA_SR_DRDY`, and logs the result. |
+| `ata_init` | Selects the master drive on the primary bus, reads the status register, warns if the bus is floating (`0xFF`), and logs the result. |
 | `ata_read_sector` | Reads exactly 512 bytes from the sector at `lba` into `buffer`. Blocks while `ATA_SR_BSY` is set. |
 | `ata_write_sector` | Writes 512 bytes from `buffer` to the sector at `lba`. Issues `ATA_CMD_CACHE_FLUSH` after the transfer to commit the data. |
 | `ata_read_sectors` | Reads `count` consecutive 512-byte sectors starting at `lba`. Equivalent to calling `ata_read_sector` in a loop but issues a single multi-sector command for efficiency. |
@@ -124,7 +128,7 @@ void rtc_get_time(rtc_time_t *time);
 
 | Function | Description |
 |---|---|
-| `rtc_init` | Verifies the RTC is not in an update cycle and logs initialization to serial. |
+| `rtc_init` | Placeholder reserved for future RTC interrupt configuration; currently a no-op. |
 | `rtc_get_time` | Waits until the CMOS update-in-progress flag clears, reads all six time registers, converts BCD to binary where necessary, and writes the result into the caller-supplied `rtc_time_t`. |
 
 The desktop taskbar calls `rtc_get_time` on every rendered frame and formats the result into the clock widget in the bottom-right corner. Because `rtc_get_time` spins waiting for the update-in-progress bit, it should not be called more often than once per frame (or approximately 60 times per second).

@@ -61,7 +61,7 @@ SilverOS is organised into six horizontal layers. Each layer depends only on the
 
 <Steps>
   <Step title="Serial init">
-    `serial_init()` brings up the COM1 UART at 115 200 baud. All subsequent `serial_printf` calls provide a live debug log independent of the framebuffer.
+    `serial_init()` brings up the COM1 UART at 38 400 baud (divisor 3). All subsequent `serial_printf` calls provide a live debug log independent of the framebuffer.
   </Step>
   <Step title="Multiboot2 parsing">
     The Multiboot2 info struct is walked tag-by-tag. Three tags are extracted and cached: **type 8** (framebuffer address, dimensions, bpp), **type 4** (basic memory sizes), and **type 6** (full memory map needed by PMM). An invalid magic value causes an immediate halt.

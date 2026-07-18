@@ -1,7 +1,7 @@
 ---
 title: "Physical Memory Manager and Kernel Heap in SilverOS"
 sidebarTitle: "Memory Management"
-description: "SilverOS manages physical pages with a flat bitmap allocator and provides kernel dynamic memory via a linked-list heap. Full API reference for pmm and heap."
+description: "SilverOS manages physical pages with a flat bitmap allocator and provides kernel dynamic memory via a linked-list heap. API reference for pmm and heap."
 ---
 
 SilverOS manages memory in two distinct layers. The Physical Memory Manager (PMM) operates at page granularity, keeping track of which 4 KB frames are in use across the entire address space using a flat bitmap. On top of that, the kernel heap provides the familiar `kmalloc`/`kfree` interface for variable-size allocations within a fixed 4 MB region. Neither layer involves virtual memory or page tables — all addresses are physical, and the kernel runs identity-mapped.
